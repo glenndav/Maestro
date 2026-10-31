@@ -3380,10 +3380,12 @@ def _build_enhance_user_prompt(
                     "new plot events, outcomes, or dialogue. Never repeat, recap, preview, "
                     "or complete a later window's beat early.]"
                 )
+        from services.enhance_guides import model_architecture
+
         if (
             window_count
             and window_count > 1
-            and str(model_type or "").lower().startswith("ltx")
+            and model_architecture(model_type).lower().startswith("ltx")
         ):
             context += (
                 "\n[LTX STANDALONE-WINDOW CONTRACT: Each paragraph is sent "
@@ -3458,19 +3460,23 @@ def enhance_prompt(
     reference_context = repair_text(reference_context) if reference_context else reference_context
     lora_system_hint = repair_text(lora_system_hint)
     from services.adaptive_enhancement import normalize_writing_style
+    from services.enhance_guides import model_architecture
     planning_style = normalize_writing_style(planning_style)
+    # Imported checkpoints (civitai_h3_...) keep their family only in the
+    # model definition, so the output contracts follow its architecture.
+    architecture = model_architecture(model_type).lower()
     is_h3_ref2va = (
         mode in ("video", "avatar")
-        and (model_type or "").lower().startswith("minimax_h3_ref2va")
+        and architecture.startswith("minimax_h3_ref2va")
     )
     is_h3_context_ir = (
         mode in ("video", "avatar")
-        and (model_type or "").lower().startswith("minimax_h3")
+        and architecture.startswith("minimax_h3")
         and not is_h3_ref2va
     )
     is_h3_structured = is_h3_context_ir or is_h3_ref2va
-    is_flux3_image = mode == "image" and (model_type or "").lower().startswith("flux3")
-    is_moss_image = mode == "image" and (model_type or "").lower().startswith("moss_image")
+    is_flux3_image = mode == "image" and architecture.startswith("flux3")
+    is_moss_image = mode == "image" and architecture.startswith("moss_image")
     if is_moss_image:
         # A general cinematic writer cannot safely strip MOSS's layout fields.
         raw_enhancer_mode = False

@@ -721,6 +721,49 @@ def _model_weight_groups(model_type: str, owned_only: bool = False) -> list:
     return groups
 
 
+def _handler_model_files(model_type: str) -> list:
+    """Repo file sets the family handler downloads itself.
+
+    Handler-managed models (Chatterbox) declare no URLs at all;
+    wgp.load_models() reaches their weights through download_models("", ...),
+    which calls the handler's query_model_files(). Same call shape here.
+    """
+    base_model_type = wgp.get_base_model_type(model_type)
+    handler = wgp.model_types_handlers.get(base_model_type)
+    if handler is None or not hasattr(handler, "query_model_files"):
+        return []
+
+    def compute_list(filename):
+        return [] if filename is None else [filename[filename.rfind("/") + 1:]]
+
+    files = handler.query_model_files(compute_list, base_model_type, wgp.get_runtime_model_def(model_type))
+    if not files:
+        return []
+    return files if isinstance(files, list) else [files]
+
+
+def _handler_files_downloaded(file_defs: list) -> bool:
+    """True when every file set from _handler_model_files() is on disk.
+
+    Mirrors wgp.process_files_def's layout (<root>/<target>/<source>/<file>)
+    and searches every checkpoint root, linked read-only installs included.
+    """
+    for one_repo in file_defs:
+        source_folders = one_repo.get("sourceFolderList") or []
+        target_folders = one_repo.get("targetFolderList") or [None] * len(source_folders)
+        for target, source, files in zip(target_folders, source_folders, one_repo.get("fileList") or []):
+            folder_parts = [part for part in (target, source) if part]
+            if not files:
+                folder = os.path.join(*folder_parts) if folder_parts else ""
+                if wgp.fl.locate_folder(folder, error_if_none=False) is None:
+                    return False
+                continue
+            for name in files:
+                if wgp.fl.locate_file(os.path.join(*folder_parts, name), error_if_none=False) is None:
+                    return False
+    return True
+
+
 def _check_model_downloaded(model_type: str) -> bool:
     """Check if a model's checkpoint files are downloaded.
 
@@ -733,10 +776,15 @@ def _check_model_downloaded(model_type: str) -> bool:
         if model_def is None:
             return False
         groups = _model_weight_groups(model_type)
-        if not groups:
-            return False
-        if not all(_variant_group_downloaded(g, model_type=model_type) for g in groups):
-            return False
+        if groups:
+            if not all(_variant_group_downloaded(g, model_type=model_type) for g in groups):
+                return False
+        else:
+            # No URLs to check: the family handler's own file list
+            # (query_model_files) is the whole checkpoint.
+            file_defs = _handler_model_files(model_type)
+            if not file_defs or not _handler_files_downloaded(file_defs):
+                return False
         # Some edit pipelines split required conditioning weights out of the
         # main transformer/text-encoder groups. Krea 2 Edit cannot run without
         # its Qwen3-VL vision tower, so do not report it as ready until that
@@ -1432,11 +1480,18 @@ def _download_model_files(model_type: str):
             source_type_list.append(1)
             submodel_no_list.append(0)
 
+    downloaded_any = False
     for filename, source_type, submodel_no in zip(model_file_list, source_type_list, submodel_no_list):
         check_download_cancelled()
         if len(filename) == 0:
             continue
         wgp.download_models(filename, model_type, source_type, submodel_no)
+        downloaded_any = True
+    if not downloaded_any:
+        # Handler-managed models (Chatterbox) have no URLs; load_models()
+        # fetches their weights through this same empty-filename call.
+        check_download_cancelled()
+        wgp.download_models("", model_type, 0, -1)
 
     # Match Studio and generation's hardware-aware H3 encoder default.
     # The static definition names NVFP4; low-memory hosts use Q2_K instead.
@@ -6956,6 +7011,16 @@ def _read_app_version() -> str:
 _APP_VERSION = _read_app_version()
 
 
+def _env_snapshot() -> dict:
+    """Machine settings that shaped this generation, for its sidecar.
+
+    wgp_config.json is global and mutable, so a run is only reproducible
+    later if the settings in force at write time travel with the output.
+    """
+    from services.env_snapshot import current_env_snapshot
+    return current_env_snapshot()
+
+
 @api.get("/api/v1/system-config")
 def get_system_config():
     """Return system-level settings for the UI System tab."""
@@ -8789,7 +8854,23 @@ async def llm_generate(request: Request):
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 
+    image_paths = [str(p) for p in (body.get("image_paths") or []) if p]
+    for image_path in image_paths:
+        if not os.path.isfile(image_path):
+            raise HTTPException(status_code=400, detail=f"Image not found: {image_path}")
+
     _ensure_llm_loaded()
+
+    # A text-only model drops the images and describes one it never saw,
+    # which reads exactly like a real answer. Say so rather than invent.
+    if image_paths and not llm_service.get_status().get("vision"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The loaded model cannot accept images. Load a vision-capable "
+                "model to send one."
+            ),
+        )
 
     try:
         result = llm_service.generate(
@@ -8799,6 +8880,7 @@ async def llm_generate(request: Request):
             temperature=body.get("temperature", 0.7),
             top_p=body.get("top_p", 0.9),
             seed=body.get("seed"),
+            image_paths=image_paths or None,
         )
         return {"text": result}
     except Exception as e:
@@ -25194,6 +25276,8 @@ def _write_tool_sidecar(
 ):
     """Write a .meta.json sidecar so a Tools output shows up in the gallery
     with the right mode + edit_sub_mode tag (mirrors _run_sfx_generation)."""
+    # Local import: upstream tests execute this writer on its own.
+    from services.env_snapshot import current_env_snapshot as _env_snapshot
     sidecar = {
         "params": {**params, "edit_sub_mode": tool},
         "generation_mode": media_type,
@@ -25203,6 +25287,7 @@ def _write_tool_sidecar(
         "job_id": job_id,
         "generation_time": round(elapsed),
         "created_at": time.time(),
+        "environment": _env_snapshot(),
     }
     if tool in {"upscale", "media_flow"}:
         from services.media_info import probe_media, processing_record
@@ -27759,6 +27844,7 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                 sidecar = {
                     "params": sidecar_params,
                     "performance_plan": job.get("performance_plan"),
+                    "environment": _env_snapshot(),
                     "upload_filenames": upload_filenames,
                     "generation_mode": job["params"].get("generation_mode"),
                     "job_id": job_id,
@@ -29473,6 +29559,8 @@ def _write_recast_shot_aware_sidecar(
 ):
     """Persist restorable settings without leaking disposable shot paths."""
     import copy
+    # Local import: upstream tests execute this writer on its own.
+    from services.env_snapshot import current_env_snapshot as _env_snapshot
 
     output_name = os.path.basename(output_path)
     params = copy.deepcopy(job.get("params") or {})
@@ -29521,6 +29609,7 @@ def _write_recast_shot_aware_sidecar(
         "generation_time": int(round(float(generation_time))),
         "created_at": time.time(),
         "output_filename": output_name,
+        "environment": _env_snapshot(),
     }
     meta_path = os.path.splitext(output_path)[0] + ".meta.json"
     with open(meta_path, "w", encoding="utf-8") as handle:
@@ -29722,6 +29811,8 @@ def _write_repaint_shot_aware_sidecar(
 ):
     """Persist mapped Repaint settings without disposable shot artifacts."""
     import copy
+    # Local import: upstream tests execute this writer on its own.
+    from services.env_snapshot import current_env_snapshot as _env_snapshot
 
     output_name = os.path.basename(output_path)
     params = copy.deepcopy(job.get("params") or {})
@@ -29772,6 +29863,7 @@ def _write_repaint_shot_aware_sidecar(
         "generation_time": int(round(float(generation_time))),
         "created_at": time.time(),
         "output_filename": output_name,
+        "environment": _env_snapshot(),
     }
     meta_path = os.path.splitext(output_path)[0] + ".meta.json"
     with open(meta_path, "w", encoding="utf-8") as handle:
@@ -29977,6 +30069,8 @@ def _write_outpaint_shot_aware_sidecar(
 ):
     """Persist restorable Outpaint settings without private shot paths."""
     import copy
+    # Local import: upstream tests execute this writer on its own.
+    from services.env_snapshot import current_env_snapshot as _env_snapshot
 
     output_name = os.path.basename(output_path)
     params = copy.deepcopy(job.get("params") or {})
@@ -30045,6 +30139,7 @@ def _write_outpaint_shot_aware_sidecar(
         "generation_time": int(round(float(generation_time))),
         "created_at": time.time(),
         "output_filename": output_name,
+        "environment": _env_snapshot(),
     }
     meta_path = os.path.splitext(output_path)[0] + ".meta.json"
     with open(meta_path, "w", encoding="utf-8") as handle:

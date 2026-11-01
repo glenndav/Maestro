@@ -1,4 +1,4 @@
-"""Tests for the narrowly scoped startup-payload gzip middleware."""
+"""Tests for the startup-payload gzip middleware and the UI cache rules."""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ import unittest
 
 from starlette.applications import Starlette
 from starlette.responses import FileResponse, Response, StreamingResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route
 from starlette.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
-from services.ui_delivery import UIStartupGZipMiddleware  # noqa: E402
+from services.ui_delivery import UIStartupGZipMiddleware, UIStaticFiles  # noqa: E402
 
 
 class UIStartupGZipMiddlewareTests(unittest.TestCase):
@@ -199,6 +199,60 @@ class UIStartupGZipMiddlewareTests(unittest.TestCase):
         )
         self.assertNotIn("content-encoding", post.headers)
         self.assertEqual(post.content, self.catalogue_body)
+
+
+class UIStaticFilesCacheTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        dist = Path(temp.name)
+        (dist / "assets").mkdir()
+        (dist / "index.html").write_text(
+            '<script type="module" src="/assets/index-B5T8CBC4.js"></script>',
+            encoding="utf-8",
+        )
+        (dist / "maestro-sw.js").write_text("self.skipWaiting()", encoding="utf-8")
+        (dist / "assets" / "index-B5T8CBC4.js").write_text("export {}", encoding="utf-8")
+        (dist / "assets" / "SettingsDrawer-Cb_O9JTu.js").write_text("export {}", encoding="utf-8")
+        (dist / "assets" / "index-Az09_Bcd.css").write_text("body{}", encoding="utf-8")
+        app = Starlette(routes=[Mount("/", UIStaticFiles(directory=dist, html=True))])
+        self.client = TestClient(app)
+        self.addCleanup(self.client.close)
+
+    def test_shell_and_unhashed_root_files_are_always_revalidated(self):
+        for path in ("/", "/index.html", "/maestro-sw.js"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["cache-control"], "no-cache")
+                self.assertIn("etag", response.headers)
+
+    def test_revalidated_shell_answers_304_with_the_same_rule(self):
+        etag = self.client.get("/").headers["etag"]
+        response = self.client.get("/", headers={"if-none-match": etag})
+
+        self.assertEqual(response.status_code, 304)
+        self.assertEqual(response.headers["cache-control"], "no-cache")
+
+    def test_hashed_build_files_are_immutable(self):
+        for path in (
+            "/assets/index-B5T8CBC4.js",
+            "/assets/SettingsDrawer-Cb_O9JTu.js",
+            "/assets/index-Az09_Bcd.css",
+        ):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.headers["cache-control"],
+                    "public, max-age=31536000, immutable",
+                )
+
+    def test_a_previous_build_chunk_is_a_plain_404(self):
+        response = self.client.get("/assets/SettingsDrawer-BZSzWNLb.js")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn("immutable", response.headers.get("cache-control", ""))
 
 
 if __name__ == "__main__":

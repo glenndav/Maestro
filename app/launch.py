@@ -279,13 +279,12 @@ sys.argv = _original_argv
 
 # --- FastAPI setup ---
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from services.access_log_filter import install_quiet_access_filter
 from services.http_runtime import configure_http_runtime
-from services.ui_delivery import UIStartupGZipMiddleware
+from services.ui_delivery import UIStartupGZipMiddleware, UIStaticFiles
 
 # Uvicorn's logging configuration replaces handlers but retains logger-level
 # filters. Install early, then idempotently confirm it again before startup.
@@ -31310,7 +31309,7 @@ if os.environ.get("MAESTRO_PROMPT_BENCH") == "1" or os.path.isfile(
 
 _ui_dist = os.path.normpath(os.path.join(_app_dir, "..", "ui", "dist"))
 if os.path.isdir(_ui_dist):
-    api.mount("/", StaticFiles(directory=_ui_dist, html=True))
+    api.mount("/", UIStaticFiles(directory=_ui_dist, html=True))
     print(f"[Maestro] React UI serving from {_ui_dist}")
 else:
     @api.get("/")

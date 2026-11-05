@@ -4,6 +4,59 @@ Every dated update announcement from Maestro's first public release onward, newe
 
 [Back to the README](../README.md#updates) · [Detailed changelog](../CHANGELOG.md)
 
+### v4.0.0 (2026-11-04)
+
+Maestro v4.0.0 is available on **Main and Dev**.
+
+- **An upgraded Editor and animated titles:** a fuller editing workspace,
+  reviewable Auto-edit plans with undo, chroma key and transparent ProRes 4444
+  MOV export. Describe animated titles directly in Studio or the Editor.
+- **Pika H3 Flex:** experimental Frames and References generation, source-audio
+  conditioning, SLA with a compatibility fallback, and motion/audio sliding
+  windows. Five resolution tiers include experimental 1080p; saved window
+  choices survive settings reuse and resolution changes.
+- **Built-in MCP:** independent local and remote connections, scoped approval,
+  model-aware authoring guides, saved characters and externally authored
+  music-video plans with native song analysis. Existing browser access stays
+  available.
+- **Optional ComfyUI integration:** reuse model folders, import typed API
+  workflows and route supported native or Director requests through an existing
+  ComfyUI server. Nothing is enabled or installed automatically.
+- **A fresh appearance:** first opening v4 switches to Graphite Studio in Dark
+  mode once. Choose another theme afterward and that choice stays saved.
+  Compact pinned controls, resizable thumbnails and mobile/startup recovery
+  make everyday use smoother.
+- **More creative models and finishing:** MOSS reference editors, Fibo 2.0,
+  Qwen reference caches, H3 accelerators/PTD/two-pass options and FlashVSR+ Turbo.
+  Worlds and Profile 0 remain optional experimental tools.
+- **More reliable writing and review:** clearer reference roles, exact dialogue
+  and speaker recovery, retained rejected drafts, Director planning fixes,
+  failed-job settings/LoRA details, Turbo LoRA filters and quieter logs.
+
+The existing Dev updates are included. See the
+[v4.0.0 release notes and testing limits](RELEASE_NOTES_V4.0.0.md).
+
+### v3.3.0 (2026-10-26) — Dev testing
+
+- **Qwen Image 2.1 reference caching:** optional INT8 caches in VRAM or system
+  RAM, with memory guards and separate positive/negative guidance caches.
+  Disabled remains the default; RAM transfers can trade speed for lower VRAM.
+- **H3 LightX2V accelerators:** four new workflow-matched four/eight-step
+  presets, with pinned weights and their correct video sampling shifts.
+- **FlashVSR+ Turbo:** a separate upscaler in Post Processing, Tools and Editor.
+  Existing FlashVSR selections keep v1.1 and its original behavior.
+- **Optional kernel updates:** compatible WGPKernels 1.4.2 and GGUF CUDA
+  1.0.29 installers, with hash-pinned downloads and existing fallbacks.
+
+Available on **Dev for testing**; Main remains v3.2.5. Update the idle Dev
+installation in Pinokio, restart Maestro and refresh the browser. CPU tests
+and the UI build passed. Functional GPU checks now cover the RTX 4090, 12GB
+RTX 3080 Ti and 8GB RTX 5070 Laptop. Follow-up fixes restore v1.1 sparse
+attention and load the official Plus checkpoint names correctly; all 12 latest
+FlashVSR image/video checks passed. These bounded checks are not a matched
+speed or general quality benchmark. See the
+[v3.3.0 Dev release notes](RELEASE_NOTES_V3.3.0.md).
+
 ### v3.2.5 (2026-10-24)
 
 - **Faster Fish speech:** whole-frame CUDA Graph decoding when the full model

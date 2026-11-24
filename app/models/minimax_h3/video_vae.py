@@ -1133,8 +1133,13 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
         mean = chunk.new_tensor((0.485, 0.456, 0.406), dtype=torch.float32).view(1, 3, 1, 1, 1)
         std = chunk.new_tensor((0.229, 0.224, 0.225), dtype=torch.float32).view(1, 3, 1, 1, 1)
         written = 0
-        for start in range(0, frames, 2):
-            stop = min(start + 2, frames)
+        # Pixel shuffling and float conversion have temporary full-resolution
+        # allocations. Keep their combined working size small at 2K and 4K.
+        scale = 2 if upsample else 1
+        scratch_per_frame = 3 * height * width * scale * scale * (chunk.element_size() + 5)
+        frames_per_copy = min(2, max(1, (64 << 20) // scratch_per_frame))
+        for start in range(0, frames, frames_per_copy):
+            stop = min(start + frames_per_copy, frames)
             frame_chunk = chunk[:, :, start:stop]
             frame_count = stop - start
             if upsample:
@@ -1155,6 +1160,36 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
                 written += destination_stop - destination_start
             del pixels, frame_chunk
         return written
+
+    def _prepare_decoded_chunk(
+        self,
+        chunk: torch.Tensor,
+        uint8_rounding: str | None = None,
+    ) -> torch.Tensor:
+        """Convert an ImageNet-normalized RGB band to the WGP pixel convention.
+
+        pi-H3 DWD calls this on each bounded GPU band before its writer copies
+        the result into the CPU output canvas. Keep the FP16 truncation path
+        aligned with the upstream WGP conversion.
+        """
+        if chunk.ndim != 5 or int(chunk.shape[1]) != 3:
+            raise ValueError(
+                "MiniMax H3 DWD pixels must have shape [batch, 3, frames, height, width]."
+            )
+        mean = chunk.new_tensor((0.485, 0.456, 0.406), dtype=torch.float32).view(1, 3, 1, 1, 1)
+        std = chunk.new_tensor((0.229, 0.224, 0.225), dtype=torch.float32).view(1, 3, 1, 1, 1)
+        decoded = chunk.float().mul_(std).add_(mean).clamp_(0.0, 1.0).mul_(2.0).sub_(1.0)
+        if uint8_rounding == "truncate":
+            return (
+                decoded.to(torch.float16)
+                .add_(1.0)
+                .mul_(127.5)
+                .clamp_(0.0, 255.0)
+                .to(torch.uint8)
+            )
+        if uint8_rounding not in (None, "round"):
+            raise ValueError(f"Unsupported MiniMax H3 DWD uint8 rounding mode {uint8_rounding!r}.")
+        return decoded.add_(1.0).mul_(127.5).round_().clamp_(0.0, 255.0).to(torch.uint8)
 
     def _decode_to_cpu_uint8_one(self, z: torch.Tensor) -> torch.Tensor:
         """Decode one latent video into a compact CPU canvas, temporal chunk by chunk."""

@@ -37,6 +37,32 @@ Runtime upgrades are explicit menu actions. A missing performance-runtime marker
 does not automatically run Update when you open the launcher. If offered,
 **Start with Compatibility Runtime** keeps the existing runtime available.
 
+### v4.2.0 (2026-11-23)
+
+- **Generate H3 video in 2 or 4 steps** with pi-H3 Frames recipes and dedicated
+  DWD models that decode the picture in the last denoising pass. Experimental
+  H3 HyperFlow Flash 14B adds another low-step option for Frames and References.
+- **Preview Studio Recipes before using them.** Play short examples and load a
+  recipe's model settings and prompt guidance. MCP clients can read the same
+  recipe guidance.
+- **Edit keyframes and keep the original soundtrack.** Remake can round-trip
+  up to four frames through Studio Image. Experimental BFS Aligned Swap replaces
+  a person using a single identity image. References can keep source audio in
+  the finished clip without using it to drive the video model.
+- **Change the singer and finish the music video.** Director can convert a lead
+  voice or duet parts while keeping the accompaniment and timing. Export timed
+  lyrics as SRT and queue upscaling for individual takes or the joined cut.
+- **More local generation options.** Try 2- and 4-step MiniMax H3 Image
+  presets. Experimental models add 25 fps avatars with LongCat Avatar 1.6
+  and multilingual voice cloning with ZONOS3 Mini.
+- **More reliable long renders.** Director preserves named speakers through
+  prompt enhancement and validates each H3 reference window before rendering.
+  Music-video planning resumes from accepted work. Extreme attention chunking,
+  optional SageGP and incremental video assembly expand the runtime options.
+
+Maestro v4.2.0 is available on **Main and Dev**. See the
+[release notes](docs/RELEASE_NOTES_V4.2.0.md) and [detailed changes](CHANGELOG.md#420--2026-11-23).
+
 ### v4.1.1 (2026-11-10)
 
 - **H3 Image memory fix:** Auto-Tune streams model weights for reference-heavy jobs to free VRAM for the requested canvas and references.
@@ -266,24 +292,6 @@ Use **Update** in Pinokio, restart Maestro and refresh the browser. Your existin
 [Full v2.5.0 release notes](docs/RELEASE_NOTES_V2.5.0.md) · [Validation and remaining limits](docs/VALIDATION_V2.5.0.md) · [Changelog](CHANGELOG.md)
 
 Included update details: [v2.4.2 release notes](docs/RELEASE_NOTES_V2.4.2.md) and [validation](docs/VALIDATION_V2.4.2.md); [v2.4.1 release notes](docs/RELEASE_NOTES_V2.4.1.md) and [validation](docs/VALIDATION_V2.4.1.md).
-
-### v2.4.0 (2026-09-24)
-
-**Immersive gallery, Qwen LoRA improvements, H3 Singularity, and better prompt-enhancement control**
-
-- **Fullscreen gallery:** enlarge images and browse images/videos with vertical swipes, keyboard navigation and favorites. Tap to pause or play, keep your sound choice across clips, and pinch to zoom images. Prepared video transitions and cached first-frame posters improve mobile playback. Native fullscreen is used where the browser supports it.
-- **Before/after image comparison:** move a divider between the source and result. The active sidecar image is selected by default, or compare other gallery/local images.
-- **Gallery → active input:** send images, captured frames or whole videos to the visible Studio or Director inputs, including References, Frames, Animate, editing and upscaling.
-- **Qwen Image 2.1 improvements:** a dedicated CivitAI LoRA filter, compatible fused-layer LoRA imports, and lower memory pressure when encoding multiple references. Enabled compatible Qwen models now appear in Director's image selector.
-- **H3 Singularity — Experimental:** a separate v1.3 References model with the recommended LightX2V four-step Turbo preset, managed downloads, and Studio/Director support. [Testing guide](docs/H3-Singularity.md).
-- **More reliable H3 enhancement:** more precise source-action, dialogue, reference and continuity checks; focused camera-plan repairs; and music-driven prompts that leave vocals to the supplied audio. Complex scenes can still require review.
-- **Choose repair behavior:** Settings → Integrations lets you set **0–5 fidelity repair attempts** and optionally **Generate even if fidelity checks fail** for Enhance on generation. Default behavior remains one repair attempt and review when needed.
-- **Director music fixes:** performance instructions apply to the visible cast, avoiding unwanted musicians in narrative shots. Dialogue markup, speaker/language ownership and supplied-audio handling are improved.
-- **Reliability fixes:** Windows Face Refiner cleanup, Recast mask memory, API-key saving, remote LLM reference images, and bundled DramaBox guides.
-
-Use **Update** in Pinokio, restart Maestro and refresh the browser. Existing projects, models, LoRAs and outputs stay in place. Singularity downloads its optional assets when first used.
-
-[Full v2.4.0 release notes and issue coverage](docs/RELEASE_NOTES_V2.4.0.md) · [Validation and remaining limits](docs/VALIDATION_V2.4.0.md) · [Changelog](CHANGELOG.md)
 
 ## Requirements
 

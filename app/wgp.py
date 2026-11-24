@@ -93,7 +93,7 @@ from shared.utils.loras_mutipliers import preparse_loras_multipliers, parse_lora
 from shared.utils.utils import convert_tensor_to_image, save_image, get_video_info, get_file_creation_date, convert_image_to_video, calculate_new_dimensions, convert_image_to_tensor, calculate_dimensions_and_resize_image, rescale_and_crop, get_video_frame, resize_and_remove_background, rgb_bw_to_rgba_mask, to_rgb_tensor
 from shared.utils.utils import calculate_new_dimensions, get_outpainting_frame_location, get_outpainting_full_area_dimensions
 from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension
-from shared.utils.audio_video import extract_audio_tracks, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_pair_volumes_to_temp_files, save_video, save_image
+from shared.utils.audio_video import extract_audio_tracks, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_pair_volumes_to_temp_files, save_video, save_image, slice_audio_file_from_frame
 from shared.utils.audio_video import save_image_metadata, read_image_metadata, extract_audio_track_to_wav, write_wav_file, save_audio_file, get_audio_codec_extension, append_sliding_window_audio, create_silent_wav_file
 from services.video_encoding import get_video_encoding
 from shared.utils.audio_metadata import save_audio_metadata, read_audio_metadata, extract_creation_datetime_from_metadata, resolve_audio_creation_datetime
@@ -2246,6 +2246,7 @@ def update_generation_status(html_content):
 
 family_handlers = ["models.wan.wan_handler", "models.wan.ovi_handler", "models.wan.df_handler", "models.hyvideo.hunyuan_handler", "models.ltx_video.ltxv_handler", "models.ltx2.ltx2_handler", "models.ltx25.ltx25_handler", "models.ltx2.scenema_audio_handler", "models.ltx2.ltx_audio_tts_handler", "models.minimax_h3.minimax_h3_handler", "models.minimax_h3.image_handler", "models.longcat.longcat_handler", "models.flux.flux_handler", "models.flux3.flux3_handler", "models.moss_image.moss_image_handler", "models.fibo2.fibo2_handler", "models.qwen.qwen_handler", "models.qwen21.qwen21_handler", "models.kandinsky5.kandinsky_handler",  "models.z_image.z_image_handler", "models.krea2.krea2_handler", "models.hidream.hidream_handler", "models.TTS.ace_step_handler", "models.TTS.chatterbox_handler", "models.TTS.qwen3_handler", "models.TTS.yue_handler", "models.TTS.yue2.yue2_handler", "models.TTS.heartmula_handler", "models.TTS.kugelaudio_handler", "models.TTS.minimax_music3_handler", "models.TTS.index_tts2_handler", "models.TTS.fish_audio.fish_audio_handler"]
 family_handlers.append("models.TTS.fish_audio_small.fish_audio_small_handler")
+family_handlers.append("models.TTS.zonos3.zonos3_handler")
 family_handlers.append("models.hy_nomas.hy_nomas_handler")
 DEFAULT_LORA_ROOT = "loras"
 
@@ -2829,8 +2830,14 @@ from services.generation_preview import DEFAULT_PREVIEW_MODE
 server_config.setdefault("generation_preview", DEFAULT_PREVIEW_MODE)
 from services.memory_settings import apply_memory_defaults
 apply_memory_defaults(server_config)
-from shared import attention_kit
+from shared import attention_kit, sagegp_runtime
 attention_kit.configure(server_config["attention_head_split"])
+try:
+    attention_kit.configure_chunker(
+        server_config.get(attention_kit.CHUNKER_CONFIG_KEY, attention_kit.CHUNKER_DEFAULT)
+    )
+except ValueError:
+    attention_kit.configure_chunker(attention_kit.CHUNKER_DEFAULT)
 if args.prevent_power_throttling:
     prevent_power_throttling()
 
@@ -3176,14 +3183,14 @@ def get_model_fps(model_type):
     fps= model_def.get("fps", 16)
     return fps
 
-def get_computed_fps(force_fps, base_model_type , video_guide, video_source ):
+def get_computed_fps(force_fps, model_type, video_guide, video_source):
     if force_fps == "auto":
         if video_source != None:
             fps,  _, _, _ = get_video_info(video_source)
         elif video_guide != None:
             fps,  _, _, _ = get_video_info(video_guide)
         else:
-            fps = get_model_fps(base_model_type)
+            fps = get_model_fps(model_type)
     elif force_fps == "control" and video_guide != None:
         fps,  _, _, _ = get_video_info(video_guide)
     elif force_fps == "source" and video_source != None:
@@ -3191,7 +3198,7 @@ def get_computed_fps(force_fps, base_model_type , video_guide, video_source ):
     elif len(force_fps) > 0 and is_integer(force_fps) :
         fps = int(force_fps)
     else:
-        fps = get_model_fps(base_model_type)
+        fps = get_model_fps(model_type)
     return fps
 
 def get_model_name(model_type, description_container = [""]):
@@ -5237,6 +5244,7 @@ def build_callback(state, pipe, send_cmd, status, num_inference_steps, preview_m
             phase, state_step_idx = gen["progress_phase"]
             step_idx = state_step_idx if step_idx < 0 else step_idx + 1
         else:
+            sagegp_runtime.set_step(step_idx + 1)
             step_idx += 1         
             if gen.get("abort", False):
                 # Model wrappers may clear their flag at generate() entry;
@@ -7244,6 +7252,7 @@ def concatenate_multi_clip_videos(
     """
     import subprocess
     import math
+    import json
     import time
     from services.video_encoding import get_video_encoding as _get_video_encoding
 
@@ -7304,6 +7313,91 @@ def concatenate_multi_clip_videos(
         return False
 
     n = len(valid_paths)
+
+    # ffmpeg's concat filter requires identical frame dimensions and sample
+    # aspect ratios. Director clips can differ when they were rendered with
+    # different LTX resolutions, so fit each input into one shared canvas.
+    # Base the canvas on the first clip's display aspect ratio (the project's
+    # established orientation) and the largest input dimension. This keeps
+    # the expected output shape while retaining detail from larger clips.
+    clip_geometry = []
+    try:
+        for path in valid_paths:
+            geometry_probe = subprocess.run(
+                [
+                    ffprobe_bin, "-v", "error", "-select_streams", "v:0",
+                    "-show_entries",
+                    "stream=width,height,sample_aspect_ratio",
+                    "-of", "json", path.replace("\\", "/"),
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            if geometry_probe.returncode != 0:
+                raise ValueError(geometry_probe.stderr or "ffprobe failed")
+            streams = json.loads(geometry_probe.stdout).get("streams") or []
+            if not streams:
+                raise ValueError("ffprobe found no video stream")
+            stream = streams[0]
+            width = int(stream["width"])
+            height = int(stream["height"])
+            if width <= 0 or height <= 0:
+                raise ValueError("ffprobe returned invalid video dimensions")
+            sample_aspect_ratio = stream.get("sample_aspect_ratio") or "1:1"
+            try:
+                sar_num, sar_den = (
+                    float(part) for part in sample_aspect_ratio.split(":", 1)
+                )
+                sar = sar_num / sar_den if sar_num > 0 and sar_den > 0 else 1.0
+            except (TypeError, ValueError, ZeroDivisionError):
+                sar = 1.0
+            if not math.isfinite(sar) or sar <= 0:
+                sar = 1.0
+            clip_geometry.append((width, height, sar))
+
+        first_width, first_height, first_sar = clip_geometry[0]
+        canvas_aspect = first_width * first_sar / first_height
+        longest_input_edge = max(
+            max(width * sar, height) for width, height, sar in clip_geometry
+        )
+
+        def _even_dimension(value):
+            return max(2, int(round(float(value) / 2.0) * 2))
+
+        if canvas_aspect >= 1.0:
+            canvas_width = _even_dimension(longest_input_edge)
+            canvas_height = _even_dimension(canvas_width / canvas_aspect)
+        else:
+            canvas_height = _even_dimension(longest_input_edge)
+            canvas_width = _even_dimension(canvas_height * canvas_aspect)
+    except Exception as exc:
+        # Preserve legacy concat behavior if ffprobe is unavailable or cannot
+        # inspect an otherwise decodable input.
+        print(
+            "[Multi-Clip] Could not inspect clip geometry; using direct concat: "
+            f"{exc}"
+        )
+        canvas_width = canvas_height = None
+
+    if canvas_width and canvas_height and len(set(clip_geometry)) > 1:
+        video_filter_prefix = ";".join(
+            (
+                f"[{index}:v]"
+                "scale='max(2,trunc(iw*if(gt(sar,0),sar,1)/2)*2)':ih,setsar=1,"
+                f"scale={canvas_width}:{canvas_height}:"
+                "force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                f"pad={canvas_width}:{canvas_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"setsar=1,setpts=PTS-STARTPTS[normv{index}]"
+            )
+            for index in range(n)
+        ) + ";"
+        video_streams = [f"[normv{index}]" for index in range(n)]
+        print(
+            f"[Multi-Clip] Normalizing video to {canvas_width}x{canvas_height} "
+            "(square pixels, aspect preserved)"
+        )
+    else:
+        video_filter_prefix = ""
+        video_streams = [f"[{index}:v]" for index in range(n)]
 
     try:
         audio_start_sec = float(audio_start_sec or 0)
@@ -7465,27 +7559,37 @@ def concatenate_multi_clip_videos(
     # Build filter_complex string
     if use_clip_audio:
         # Concat both video and audio streams from each clip
-        filter_inputs = "".join(f"[{i}:v][{i}:a]" for i in range(n))
+        filter_inputs = "".join(
+            f"{video_streams[i]}[{i}:a]" for i in range(n)
+        )
         if video_duration_sec is not None:
             filter_str = (
-                f"{filter_inputs}concat=n={n}:v=1:a=1[joinedv][joineda];"
+                f"{video_filter_prefix}{filter_inputs}"
+                f"concat=n={n}:v=1:a=1[joinedv][joineda];"
                 f"[joinedv]trim=duration={video_duration_sec:.6f},setpts=PTS-STARTPTS[outv];"
                 f"[joineda]atrim=duration={video_duration_sec:.6f},asetpts=PTS-STARTPTS[outa]"
             )
         else:
-            filter_str = f"{filter_inputs}concat=n={n}:v=1:a=1[outv][outa]"
+            filter_str = (
+                f"{video_filter_prefix}{filter_inputs}"
+                f"concat=n={n}:v=1:a=1[outv][outa]"
+            )
         cmd += ["-filter_complex", filter_str]
         cmd += ["-map", "[outv]", "-map", "[outa]"]
         cmd += ["-c:a", "aac"]
     else:
-        filter_inputs = "".join(f"[{i}:v]" for i in range(n))
+        filter_inputs = "".join(video_streams)
         if video_duration_sec is not None:
             filter_str = (
-                f"{filter_inputs}concat=n={n}:v=1:a=0[joinedv];"
+                f"{video_filter_prefix}{filter_inputs}"
+                f"concat=n={n}:v=1:a=0[joinedv];"
                 f"[joinedv]trim=duration={video_duration_sec:.6f},setpts=PTS-STARTPTS[outv]"
             )
         else:
-            filter_str = f"{filter_inputs}concat=n={n}:v=1:a=0[outv]"
+            filter_str = (
+                f"{video_filter_prefix}{filter_inputs}"
+                f"concat=n={n}:v=1:a=0[outv]"
+            )
         if audio_path and (audio_start_sec > 0 or pad_audio):
             audio_filters = []
             if audio_start_sec > 0:
@@ -8062,6 +8166,8 @@ def _resolve_image_ref_fit(model_def, auto_aspect):
     return ref_fit
 
 @cleanup_failed_generation(lambda: release_generation_memory())
+@sagegp_runtime.sampling_scope()
+@attention_kit.chunker_scope()
 def generate_video(
     task,
     send_cmd,
@@ -8270,6 +8376,9 @@ def generate_video(
     source_audio_transcript_in_prompt=False,
     source_audio_transcript_for_enhancement=False,
     source_audio_transcript_data=None,
+    # Request-only H3 Reference soundtrack, restored after generation without
+    # entering the model's conditioning or saved settings.
+    _h3_output_audio_path=None,
     # Optional pre-separated vocal stem used only for model conditioning.
     # ``audio_guide`` remains the pristine soundtrack that is muxed into the
     # published video. Director uses this to give LTX-2.5 a clearer lip-sync
@@ -8307,6 +8416,9 @@ def generate_video(
     gen = get_gen_info(state)
     if gen.get("abort", False):
         return False
+    sagegp_runtime.configure_sampling(
+        server_config.get("sagegp_first_step_precise", sagegp_runtime.FIRST_STEP_PRECISE_DEFAULT)
+    )
     # Head splitting is a generation-boundary setting. Editing settings while
     # a job runs must not change the attention grouping inside that job.
     from services.memory_settings import per_job_attention_head_split
@@ -8339,6 +8451,18 @@ def generate_video(
     model_def = h3_duration_model_def(model_def, {
         "minimax_h3_extended_duration": minimax_h3_extended_duration,
     })
+    if _h3_output_audio_path:
+        if not model_def.get("omni_reference"):
+            raise ValueError(
+                "Keep source audio (output only) is supported for MiniMax H3 Studio References."
+            )
+        if not os.path.isfile(_h3_output_audio_path):
+            raise ValueError("The selected output-only soundtrack is no longer available.")
+        if str(audio_prompt_type or "").strip() == "AD" and (audio_guide or input_waveform is not None):
+            raise ValueError(
+                "Keep source audio (output only) cannot be combined with a separate "
+                "Frames Music / performance soundtrack. Choose one output soundtrack."
+            )
     recipe = apply_model_acceleration_profile(model_type, {
         "sample_solver": sample_solver,
         "num_inference_steps": num_inference_steps,
@@ -8636,6 +8760,10 @@ def generate_video(
         # recipe unusable on otherwise supported CUDA installations.
         print("[Pika H3 Flex] Sage2 is unavailable in this runtime; using dense SDPA.")
         attn = "sdpa"
+    elif attn in sagegp_runtime.MODES and attn not in override_attention_modes_supported:
+        fallback = get_default_attention_mode()
+        send_cmd("info", f"SageGP mode '{attn}' is unavailable on this GPU. Using {fallback} attention.")
+        attn = fallback
     elif attn not in override_attention_modes_supported:
         send_cmd("info", f"You have selected attention mode '{attn}'. However it is not installed or supported on your system. You should either install it or switch to the default 'sdpa' attention.")
         send_cmd("exit")
@@ -8865,6 +8993,19 @@ def generate_video(
         else:
             prompts = prompt.split("\n")
             prompts = [part.strip() for part in prompts if len(part.strip())>0]
+    if (
+        model_def.get("omni_reference")
+        and str(model_def.get("architecture") or "").startswith("minimax_h3")
+    ):
+        from models.minimax_h3.ref2va import resolve_ref2va_visual_groups
+
+        references = (
+            minimax_h3_runtime_references
+            if minimax_h3_runtime_references is not None
+            else minimax_h3_references
+        )
+        if references:
+            minimax_h3_runtime_references = resolve_ref2va_visual_groups(prompts, references)
     if len(prompts) > 1:
         print(f"[Prompt Split] {len(prompts)} prompts from multi-line input (multi_prompts_gen_type={multi_prompts_gen_type})")
     parsed_keep_frames_video_source= max_source_video_frames if len(keep_frames_video_source) ==0 else int(keep_frames_video_source) 
@@ -8905,6 +9046,8 @@ def generate_video(
         errors = check_loras_exist(model_type, activated_loras, True, send_cmd)
         if len(errors) > 0 : raise gr.Error(errors)
         loras_selected += [ resolve_lora_path(model_type, lora) for lora in activated_loras]
+    elif loras_selected:
+        print(f"[LoRA] Using model-provided LoRAs: {[os.path.basename(lora) for lora in loras_selected]}")
     else:
         print(f"[LoRA] No LoRAs activated for this generation (model_type={model_type})")
 
@@ -9072,7 +9215,7 @@ def generate_video(
         else:
             mp4_files = glob.glob(os.path.join(save_path, "*.mp4"))
             video_source = max(mp4_files, key=os.path.getmtime) if mp4_files else None                            
-    fps = 1 if is_image else get_computed_fps(force_fps, base_model_type , video_guide, video_source )
+    fps = 1 if is_image else get_computed_fps(force_fps, model_type, video_guide, video_source)
     control_audio_tracks = source_audio_tracks = source_audio_metadata = []
     if any_letters(audio_prompt_type, "R") and video_guide is not None and MMAudio_setting == 0 and not any_letters(audio_prompt_type, "ABXK"):
         control_audio_tracks, _  = extract_audio_tracks(video_guide, temp_format="wav")
@@ -9304,6 +9447,26 @@ def generate_video(
                     _, output_new_audio_data = get_full_audio_embeddings(audio_guide1 = original_audio_guide, audio_guide2= original_audio_guide2, combination_type= combination_type , num_frames= max_source_video_frames, sr= audio_sampling_rate, fps =fps, padded_frames_for_embeddings = (reuse_frames if reset_control_aligment else 0), min_audio_duration = min_audio_duration, return_sum_only= True) 
                 output_new_audio_filepath=  None # need to build original speaker track if it changed size (due to padding at the end) or if it has been combined
 
+    # The H3 output-only source uses the same clip-origin slicing as an exact
+    # audio guide, but never becomes an audio conditioning input. API preflight
+    # canonicalizes this path to WAV, so SoundFile seeks at the source sample
+    # rate and leaves the soundtrack's timeline intact.
+    if audio_frame_offset > 0 and _h3_output_audio_path is not None:
+        trimmed_audio_path = get_available_filename(
+            save_path,
+            _h3_output_audio_path,
+            "_h3_output_clip_offset",
+            ".wav",
+        )
+        slice_audio_file_from_frame(
+            _h3_output_audio_path,
+            audio_frame_offset,
+            fps,
+            trimmed_audio_path,
+        )
+        _h3_output_audio_path = trimmed_audio_path
+        temp_filenames_list.append(trimmed_audio_path)
+
     if hunyuan_custom_edit and video_guide != None:
         import cv2
         cap = cv2.VideoCapture(video_guide)
@@ -9431,6 +9594,14 @@ def generate_video(
         source_video_frames_count = 0  # number of frames to use in source video (processing starts source_video_overlap_frames_count frames before )
         frames_already_processed = []
         frames_already_processed_count = 0
+        window_video_writer = None
+        bounded_window_output = (
+            sliding_window and video_source is None and not trim_tail_frames
+            and _progressive_pad_info is None and not MMAudio_setting
+            and not model_def.get("world_model")
+            and server_config.get("video_container", "mp4") == "mp4"
+            and shutil.which("ffmpeg") is not None
+        )
         overlapped_latents = None
         context_scale = None
         window_no = 0
@@ -10851,12 +11022,32 @@ def generate_video(
                     output_frame_count = None
                     any_mmaudio = False
                 else:
-                    frames_already_processed.append(sample)
                     frames_already_processed_count += sample.shape[1]
-                    output_video_frames = frames_already_processed
+                    if bounded_window_output:
+                        from shared.utils.window_video_writer import WindowVideoWriter
+
+                        if window_video_writer is None:
+                            window_video_writer = WindowVideoWriter(fps=output_fps, directory=save_path)
+                        window_video_writer.append(
+                            sample,
+                            encode=lambda frames, filename: save_video(
+                                tensor=[frames], save_file=filename, fps=output_fps,
+                                nrow=1, normalize=True, value_range=(-1, 1),
+                                codec_type=server_config.get("video_output_codec"), container="mp4",
+                            ),
+                        )
+                        output_video_frames = None
+                    else:
+                        frames_already_processed.append(sample)
+                        output_video_frames = frames_already_processed
                     output_frame_count = frames_already_processed_count
                     sample = None
-                    any_mmaudio = MMAudio_setting != 0 and mmaudio_enabled and output_frame_count >= fps
+                    any_mmaudio = (
+                        _h3_output_audio_path is None
+                        and MMAudio_setting != 0
+                        and mmaudio_enabled
+                        and output_frame_count >= fps
+                    )
                 time_flag = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%Hh%Mm%Ss")
                 save_prompt = original_prompts[0]
                 if audio_only:
@@ -10874,6 +11065,16 @@ def generate_video(
                     extension = container
                     output_dir = save_path
                 inputs = get_function_arguments(generate_video, locals())
+                # This source is request-only and is consumed exclusively by
+                # the final mux below; keep it out of saved metadata and H3
+                # runtime inputs.
+                inputs.pop("_h3_output_audio_path", None)
+                # The full source path is needed for the live hard-cut join,
+                # but is request-only and should not appear in saved settings.
+                if _h3_output_audio_path and isinstance(inputs.get("multi_clip_info"), dict):
+                    saved_multi_clip_info = dict(inputs["multi_clip_info"])
+                    saved_multi_clip_info.pop("concat_audio_path", None)
+                    inputs["multi_clip_info"] = saved_multi_clip_info
                 # Only the window-local context belongs in output prompts.
                 # The full source transcript stays in its private ASR cache.
                 inputs.pop("source_audio_transcript_data", None)
@@ -10937,10 +11138,13 @@ def generate_video(
                         new_image_path.append(save_image(img, save_file = img_path, quality = image_output_codec or server_config.get("image_output_codec", None)))
 
                     video_path= new_image_path
-                elif len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0 or output_new_audio_filepath is not None or any_mmaudio or output_new_audio_data is not None or audio_source is not None:
+                elif len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0 or output_new_audio_filepath is not None or any_mmaudio or output_new_audio_data is not None or audio_source is not None or _h3_output_audio_path is not None:
                     video_path = os.path.join(save_path, file_name)
                     save_path_tmp = video_path.rsplit('.', 1)[0] + f"_tmp.{container}"
-                    save_video( tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type = server_config.get("video_output_codec", None), container=container)
+                    if window_video_writer is not None:
+                        window_video_writer.write_video(save_path_tmp)
+                    else:
+                        save_video( tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type = server_config.get("video_output_codec", None), container=container)
                     output_new_audio_temp_filepath = None
                     try:
                         new_audio_added_from_audio_start =  reset_control_aligment or full_generated_audio is not None # if not beginning of audio will be skipped
@@ -10962,17 +11166,39 @@ def generate_video(
                         else:
                             new_audio_tracks = control_audio_tracks
                         if generated_audio is not None: output_new_audio_filepath = None
-                        mux_audio_sampling_rate = resolve_mux_audio_sampling_rate(output_audio_sampling_rate, source_audio_metadata, new_audio_tracks)
+                        mux_source_audio_tracks = source_audio_tracks
+                        mux_source_audio_duration = source_audio_duration
+                        mux_source_audio_metadata = source_audio_metadata
+                        mux_new_audio_from_start = new_audio_added_from_audio_start
+                        mux_default_audio_rate = output_audio_sampling_rate
+                        if _h3_output_audio_path is not None:
+                            # Output-only audio is authoritative. Discard any
+                            # generated/control/source-video tracks and mux the
+                            # selected soundtrack from this clip's exact source
+                            # clock origin through the saved video duration.
+                            mux_source_audio_tracks = []
+                            mux_source_audio_duration = 0
+                            mux_source_audio_metadata = []
+                            new_audio_tracks = [_h3_output_audio_path]
+                            mux_new_audio_from_start = True
+                            mux_default_audio_rate = get_audio_file_sample_rate(
+                                _h3_output_audio_path
+                            )
+                        mux_audio_sampling_rate = resolve_mux_audio_sampling_rate(
+                            mux_default_audio_rate,
+                            mux_source_audio_metadata,
+                            new_audio_tracks,
+                        )
 
                         combine_and_concatenate_video_with_audio_tracks(
                             video_path,
                             save_path_tmp,
-                            source_audio_tracks,
+                            mux_source_audio_tracks,
                             new_audio_tracks,
-                            source_audio_duration,
+                            mux_source_audio_duration,
                             mux_audio_sampling_rate,
-                            new_audio_from_start=new_audio_added_from_audio_start,
-                            source_audio_metadata=source_audio_metadata,
+                            new_audio_from_start=mux_new_audio_from_start,
+                            source_audio_metadata=mux_source_audio_metadata,
                             audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
                             verbose=verbose_level >= 2,
                         )
@@ -10996,7 +11222,10 @@ def generate_video(
                                 print(f"  [WARN] Could not delete temp audio file (locked): {output_new_audio_temp_filepath}")
 
                 else:
-                    save_video( tensor=output_video_frames, save_file=video_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1),  codec_type= server_config.get("video_output_codec", None), container= container)
+                    if window_video_writer is not None:
+                        window_video_writer.write_video(video_path)
+                    else:
+                        save_video( tensor=output_video_frames, save_file=video_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1),  codec_type= server_config.get("video_output_codec", None), container= container)
 
                 # Register primary media immediately after its successful
                 # write. Gallery registration happens later, after metadata
@@ -11332,7 +11561,6 @@ def generate_video(
                                 if retake_audio_path and os.path.isfile(retake_audio_path):
                                     try: os.remove(retake_audio_path)
                                     except OSError: pass
-                                import shutil
                                 shutil.rmtree(si.get("temp_dir", ""), ignore_errors=True)
                                 _retake_stitch_info = None
                             except Exception as stitch_err:
@@ -11501,6 +11729,8 @@ def generate_video(
 
                 send_cmd("output")
 
+        if window_video_writer is not None:
+            window_video_writer.close()
         seed = set_seed(-1)
     _cleanup_generation_resources()
 
@@ -14031,8 +14261,8 @@ def compute_video_length_label(fps, current_video_length, video_length_locked = 
         ret += ", locked"
     return ret
 def refresh_video_length_label(state, current_video_length, force_fps, video_guide, video_source):
-    base_model_type = get_base_model_type(get_state_model_type(state))
-    computed_fps = get_computed_fps(force_fps, base_model_type , video_guide, video_source )
+    model_type = get_state_model_type(state)
+    computed_fps = get_computed_fps(force_fps, model_type, video_guide, video_source)
     return gr.update(label= compute_video_length_label(computed_fps, current_video_length))
 
 def get_default_value(choices, current_value, default_value = None):
@@ -14794,7 +15024,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                     
                     current_video_length = video_length_locked if video_length_locked is not None else ui_get("video_length", 81 if get_model_family(base_model_type)=="wan" else 97)
 
-                    computed_fps = get_computed_fps(ui_get("force_fps"), base_model_type , ui_defaults.get("video_guide", None), ui_defaults.get("video_source", None))
+                    computed_fps = get_computed_fps(ui_get("force_fps"), model_type, ui_defaults.get("video_guide", None), ui_defaults.get("video_source", None))
                     model_frames_maximum = model_def.get("frames_maximum", None)
                     max_frames = (
                         int(model_frames_maximum)

@@ -3,6 +3,73 @@
 All notable changes to Maestro are documented here. The upstream WanGP
 pipeline's own history lives in [app/docs/CHANGELOG.md](app/docs/CHANGELOG.md).
 
+## [4.2.0] — 2026-11-23
+
+Public Main and Dev release. See the [v4.2.0 release notes](docs/RELEASE_NOTES_V4.2.0.md).
+
+### Director and creative workflows
+
+- Preserve named H3 References dialogue speakers through prompt enhancement.
+  Validate dialogue and reference attribution in every window before rendering.
+  Allow complementary images to describe one subject while retaining separate
+  identities for distinct saved characters.
+- Checkpoint accepted music-video plans and repair failed batches while keeping
+  story events in order. Scope each shot's visual and voice references to its
+  cast and recover completed clips during assembly.
+- Audition a new singing voice in Director with **Sung by**. SeedVC can convert
+  lead vocals or duet parts while retaining the accompaniment and song timing.
+- In Director Delivery, export timed song lyrics as an SRT caption track and
+  queue upscaling for a selected shot or an already joined cut.
+- Anchor the start or end of a supported Director shot to a neighboring take.
+  Dependent shots are marked for regeneration when their source take changes.
+- Preview Recipes with short, muted video samples and apply them with their
+  required model, media and prompt guidance. MCP clients can read recipe
+  guidance too.
+- Extract and edit up to four Remake keyframes in Studio Image and return them to
+  their original slots. Experimental BFS Aligned Swap uses one identity image
+  with the original clip's framing and soundtrack.
+- **Keep source audio (output only)** in Studio References copies the selected
+  reference soundtrack into the finished clip without passing it to H3 as
+  driving audio. Remember the choice when reusing the clip's settings.
+
+### Models and acceleration
+
+- Add pDMD 2- and 4-step presets for MiniMax H3 Image text-to-image and reference
+  editing, alongside the native 6-step reset preset.
+- Add experimental H3 HyperFlow Flash 14B for Frames and References with 4, 6 and
+  8 Euler steps and optional two-pass generation.
+- Add the WanGP v20.10 pi-H3 FL2VA 2- and 4-step Frames recipes, plus dedicated
+  Pruned and Full DWD models that produce pixels in the final denoising pass.
+  The DWD variants load their matching accelerator LoRAs automatically.
+  Apply low-rank and bias changes in Pruned timestep layers, and match the
+  published audio/video schedule, seeded noise and audio tail.
+- Add experimental LongCat Avatar 1.6 Distilled with 25 fps output, an 8-step
+  scheduler and streamed audio conditioning.
+- Add experimental ZONOS3 Mini speech with support for 43 languages, 27 built-in
+  voices, reference voice cloning and delivery controls.
+
+### Reliability and performance
+
+- Use the driving media for Studio References and Avatar automatic duration,
+  respecting its window geometry. Track denoising speed per pass.
+- Add Face Refiner blending, face selection, audio guidance and before/after
+  comparison.
+- Select H3 attention head splitting from available VRAM in Auto mode and reduce
+  peak VAE conversion memory. Independently configure manual splitting.
+- Add Extreme attention input chunking for supported model paths and optional
+  SageGP Precise, Fast and Adaptive attention. Availability depends on the GPU
+  and installed kernels. Extreme chunking trades some speed for lower peak VRAM.
+- Assemble supported native sliding-window MP4s incrementally, preserving audio
+  and frame timing. Window assembly is scoped to the active job.
+- Pin optional WGPKernels 1.5.0, correct Wan 2.2 guidance defaults and respect
+  compile opt-outs. Fix FlashVSR streamed cache shapes and padding, omit
+  unsupported fields from compatible Gemini requests and improve LTX 2.5
+  second-pass failure reporting and cleanup.
+- Fix legacy Python 3.10 updates in Pinokio by resolving the pinned ONNX Runtime
+  GPU wheel across the configured package indexes. Retrying Update completes
+  setup if an older launcher hit this error after pulling the fix.
+  [Issue #241](https://github.com/Blizaine/Maestro/issues/241)
+
 ## [4.1.1] — 2026-11-10
 
 - Reserve GPU memory for reference-heavy MiniMax H3 Image renders. Auto-Tune

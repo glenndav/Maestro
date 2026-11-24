@@ -75,7 +75,7 @@ module.exports = async (kernel) => {
         venv: runtime.env,
         venv_python: runtime.python,
         path: "app",
-        message: ["python scripts/install_gguf_kernels.py", "python scripts/install_wgp_kernels.py"]
+        message: ["python scripts/install_gguf_kernels.py", "python scripts/install_wgp_kernels.py", "python scripts/install_sagegp.py"]
       }
     },
     // Fetch the seed-vc voice-conversion component (GPL-3.0). It lives in
@@ -100,6 +100,14 @@ module.exports = async (kernel) => {
           "npm install",
           "npm run build"
         ]
+      }
+    },
+    {
+      when: Boolean(runtime.requirementsMarker),
+      method: "fs.write",
+      params: {
+        path: runtime.requirementsMarker,
+        text: "Legacy runtime setup completed.\n"
       }
     },
     // SAM 3.1 segmentation service (used by experimental Inpaint mode)

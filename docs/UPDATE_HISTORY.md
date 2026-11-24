@@ -4,6 +4,16 @@ Every dated update announcement from Maestro's first public release onward, newe
 
 [Back to the README](../README.md#updates) · [Detailed changelog](../CHANGELOG.md)
 
+### v4.2.0 (2026-11-23)
+
+Available on **Main and Dev**. This release adds 2- and 4-step pi-H3 video,
+experimental H3 HyperFlow Flash, playable Studio Recipes, Remake keyframe
+round-trips, source soundtrack passthrough and Director tools for singing-voice
+conversion, lyric subtitles and upscaling. It also adds faster MiniMax H3 Image
+presets, LongCat Avatar 1.6, experimental ZONOS3 Mini and more attention controls.
+See the [release notes](RELEASE_NOTES_V4.2.0.md) and
+[detailed changes](../CHANGELOG.md#420--2026-11-23).
+
 ### v4.1.1 (2026-11-10)
 
 Auto-Tune now switches reference-heavy MiniMax H3 Image jobs to a streaming

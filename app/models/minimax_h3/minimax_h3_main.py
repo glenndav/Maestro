@@ -27,6 +27,10 @@ from shared.qtypes.int8_convrot import install_native_lora_forwards
 from shared.utils import files_locator as fl
 
 from .audio_vae import AutoencoderKLMiniMaxH3Audio
+from .aligned_guide import (
+    aligned_guide_visual_condition as _aligned_guide_visual_condition,
+    prepare_control_video_tensor,
+)
 from .checkpoint import (
     _rename_video_vae_key,
     preprocess_audio_vae_state_dict,
@@ -101,6 +105,14 @@ from .turbo import (
     h3_scheduler_grid_points,
     minimax_h3_adapter_workflow,
     minimax_h3_turbo_preset_for_path,
+)
+from .pi_h3 import (
+    PI_H3_AUDIO_TAIL_LATENTS,
+    _map_pi_h3_audio_sigmas,
+    _scale_pi_h3_initial_noise,
+    pi_h3_adapter_steps,
+    pi_h3_dwd_adapter_steps,
+    pi_h3_sigmas,
 )
 from .pdd import (
     PDD_NUM_EVALUATIONS,
@@ -445,26 +457,7 @@ def _prepare_control_video_tensor(
     width: int,
 ) -> torch.Tensor | None:
     """Normalize a control video to CPU ``CTHW`` pixels in ``[-1, 1]``."""
-
-    source = _as_video_tensor(video)
-    if source is None:
-        return None
-    source = source.detach().to(device="cpu")
-    if source.dtype == torch.uint8:
-        source = source.float().div(127.5).sub(1.0)
-    else:
-        source = source.float()
-        if float(source.amin()) >= -0.01 and float(source.amax()) <= 1.01:
-            source = source.mul(2.0).sub(1.0)
-        source = source.clamp(-1.0, 1.0)
-    if tuple(source.shape[-2:]) != (int(height), int(width)):
-        source = F.interpolate(
-            source.permute(1, 0, 2, 3),
-            size=(int(height), int(width)),
-            mode="bilinear",
-            align_corners=False,
-        ).permute(1, 0, 2, 3)
-    return source.contiguous()
+    return prepare_control_video_tensor(video, height, width)
 
 
 def _resize_video_mask(
@@ -1120,14 +1113,18 @@ def probe_h3_checkpoint(
             table = tensor
             break
     if table is None:
+        from .hyperflow_flash import probe_flash_checkpoint
+
+        flash = probe_flash_checkpoint(state_dict, metadata)
         return {
             "compressed_modulation": False,
             "adaln_curve_grid": None,
-            "time_embed_dim": 2688,
+            "time_embed_dim": int(flash.get("time_embed_dim", 2688)),
             "convrot": convrot,
             "quantization_format": metadata_quantization_format,
             "convrot_group_size": None,
             "fp32_adaln_modules": [],
+            **flash,
         }
     if len(table.shape) != 2 or int(table.shape[0]) < 2:
         raise ValueError(f"Invalid H3 AdaLN curve table shape: {tuple(table.shape)}")
@@ -1182,15 +1179,47 @@ def _load_transformer(
     image_model: bool = False,
     sla_config=None,
     vdn: bool = False,
+    dwd_steps: int | None = None,
     singularity: bool = False,
     dasiwa: bool = False,
     import_profile: dict | None = None,
     veda_filename: str | None = None,
     fasth3: bool = False,
     fasth3_omniref: bool = False,
+    hyperflow_flash: bool = False,
 ) -> MiniMaxH3Transformer:
     from .turbo import safetensors_header
+    filenames = list(filename) if isinstance(filename, (list, tuple)) else [filename]
     header = safetensors_header(_first_path(filename))
+    dwd_modules = []
+    for module_path in filenames[1:]:
+        module_header = safetensors_header(str(module_path))
+        dwd_key = next(
+            (key for key in module_header if str(key).endswith("dwd_head.time_table")),
+            None,
+        )
+        if dwd_key is None:
+            continue
+        metadata = module_header.get("__metadata__", {})
+        try:
+            module_steps = int(metadata.get("num_inference_steps") or 0)
+        except (AttributeError, TypeError, ValueError):
+            module_steps = 0
+        dwd_modules.append((str(module_path), module_steps))
+    if dwd_steps is not None:
+        dwd_steps = int(dwd_steps)
+        if dwd_steps not in (2, 4):
+            raise ValueError("MiniMax H3 DWD is available only in its trained 2-step or 4-step variants.")
+        if len(dwd_modules) != 1:
+            raise ValueError("MiniMax H3 DWD requires exactly one matching trained DWD module.")
+        module_path, module_steps = dwd_modules[0]
+        if module_steps != dwd_steps:
+            raise ValueError(
+                f"The selected pi-H3 DWD module is trained for {module_steps} steps, "
+                f"but the model profile requests {dwd_steps}."
+            )
+    elif dwd_modules:
+        raise ValueError("A pi-H3 DWD module requires its dedicated H3 DWD model variant.")
     if image_model:
         if fasth3 or fasth3_omniref or vdn or singularity or dasiwa or import_profile:
             raise ValueError("MiniMax H3 Image only supports its native six-step checkpoint.")
@@ -1228,6 +1257,11 @@ def _load_transformer(
         if not fasth3_omniref and (len(gates) != 50 or any(header.get(f"blocks.{i}.attn.to_gate_compress.weight", {}).get("shape") != [7168, 5376] for i in range(50))):
             raise ValueError("FastH3 V2 requires all 50 trained compression-gate projections.")
     checkpoint = probe_h3_checkpoint(_first_path(filename))
+    if bool(checkpoint.get("hyperflow_flash")) != bool(hyperflow_flash):
+        if checkpoint.get("hyperflow_flash"):
+            raise ValueError("This is a HyperFlow Flash checkpoint. Select the dedicated H3 HyperFlow model entry.")
+        if hyperflow_flash:
+            raise ValueError("The selected H3 HyperFlow entry requires its HyperFlow Flash checkpoint.")
     qkv_layout = str(qkv_layout or "contiguous").strip().lower()
     if qkv_layout not in {"contiguous", "grouped", "interleaved"}:
         raise ValueError(f"Unsupported MiniMax H3 QKV layout {qkv_layout!r}")
@@ -1271,6 +1305,9 @@ def _load_transformer(
             dtype=dtype,
             sla_config=sla_config,
             vdn=vdn,
+            dwd_head=dwd_steps is not None,
+            dropped_blocks=checkpoint.get("dropped_blocks", ()),
+            endpoint_gate=checkpoint.get("endpoint_gate"),
         )
         if fasth3:
             from .fasth3_attention import FastH3Attention
@@ -1290,6 +1327,12 @@ def _load_transformer(
             transformer.veda_attention = veda_policy
             for layer, block in enumerate(transformer.blocks):
                 block.attn.veda = VedaAttention(veda_policy, layer, device="meta")
+    # DWD's RoPE frequencies are nonpersistent and absent from the checkpoint.
+    # Recreate them after Accelerate's meta context exits, but before MMGP
+    # hydrates model data; otherwise the replacement buffer is also meta and
+    # the legacy loader rejects it as a buffer with no data.
+    if dwd_steps is not None:
+        transformer.dwd_head.refiner.reset_rope()
     inner_size = 56 * 128
     # Comfy's scaled-FP8 pruned checkpoint already stores grouped [Q, K, V]
     # weights in the exact fused layout used by this runtime. MMGP 3.7.6's
@@ -1309,7 +1352,6 @@ def _load_transformer(
     # GGUF stores packed blocks whose byte shape differs from logical rows.
     # Keep fused QKV/MLP weights, as WanGP does, and interpret their verified
     # grouped/interleaved row order in the transformer forward pass.
-    filenames = filename if isinstance(filename, (list, tuple)) else [filename]
     gguf_checkpoint = any(str(path).lower().endswith(".gguf") for path in filenames)
     if qkv_layout in {"grouped", "interleaved"} and not keep_fused_grouped_qkv and not gguf_checkpoint:
         split_map = get_linear_split_map(
@@ -1318,6 +1360,14 @@ def _load_transformer(
         )
     if split_map is not None:
         offload.split_linear_modules(transformer, split_map)
+    if checkpoint.get("low_rank"):
+        from .hyperflow_flash import replace_low_rank_linears
+
+        replace_low_rank_linears(transformer, checkpoint["low_rank"], dtype)
+    # MMGP's ConvRot loader installs quantized wrapper Parameters from the
+    # checkpoint. Freeze the meta model before loading so those INT8-backed
+    # Parameters are not created with requires_grad=True.
+    transformer.requires_grad_(False)
     offload.load_model_data(
         transformer,
         [*filenames, veda_filename] if veda_filename is not None else filename,
@@ -1331,6 +1381,7 @@ def _load_transformer(
     )
     transformer._model_dtype = dtype
     transformer.h3_checkpoint_info = checkpoint
+    transformer.dwd_steps = dwd_steps
     if singularity or dasiwa or import_profile:
         # Studio Frames changes conditioning, not this Ref2VA checkpoint's
         # AdaLN basis. MMGP otherwise chooses conversion from the UI architecture.
@@ -1671,6 +1722,13 @@ class MiniMaxH3Model:
         self.device = torch.device("cuda")
         self.dtype = dtype
         self.model_def = model_def
+        raw_dwd_steps = model_def.get("dwd", 0)
+        try:
+            self.dwd_steps = int(raw_dwd_steps or 0)
+        except (TypeError, ValueError) as error:
+            raise ValueError("MiniMax H3 DWD must declare its trained 2-step or 4-step schedule.") from error
+        if self.dwd_steps not in (0, 2, 4):
+            raise ValueError("MiniMax H3 DWD is available only in its trained 2-step or 4-step variants.")
         self.pika_flex = bool(model_def.get("minimax_h3_pika_flex"))
         self.video_vae_variant = str(
             model_def.get("minimax_h3_video_vae_variant") or "auto"
@@ -1678,6 +1736,7 @@ class MiniMaxH3Model:
         self.veda = bool(minimax_h3_veda)
         self.fasth3 = bool(model_def.get("minimax_h3_fasth3"))
         self.fasth3_omniref = bool(model_def.get("minimax_h3_fasth3_omniref"))
+        self.hyperflow_flash = bool(model_def.get("minimax_h3_hyperflow_flash"))
         if self.fasth3 and (self.veda or (model_def.get("omni_reference") and not self.fasth3_omniref) or model_def.get("vdn")):
             raise ValueError("FastH3 V2 is a separate T2AV model with mandatory VSA-H3 attention.")
         if self.fasth3:
@@ -1689,6 +1748,17 @@ class MiniMaxH3Model:
         self.audio_only = bool(model_def.get("minimax_h3_audio_only", False))
         self.viggle = bool(model_def.get("minimax_h3_viggle", False))
         self.remake_mode = model_def.get("minimax_h3_viggle_remake")
+        self.minimax_h3_aligned_guide = bool(
+            model_def.get("minimax_h3_aligned_guide", False)
+        )
+        if self.minimax_h3_aligned_guide and (
+            self.remake_mode != "swap"
+            or model_def.get("omni_reference") is not True
+            or model_def.get("minimax_h3_lora_workflow") != "ref2va"
+        ):
+            raise ValueError(
+                "BFS Aligned Swap requires its Ref2VA swap model profile."
+            )
         self.regenerate_ic = model_def.get("minimax_h3_regenerate_ic") is True
         if VAE_upsampling not in (None, "", X2_VAE_VALUE):
             raise ValueError(f"Unsupported MiniMax H3 VAE upsampling selection: {VAE_upsampling!r}.")
@@ -1715,6 +1785,24 @@ class MiniMaxH3Model:
         self.singularity = bool(model_def.get("minimax_h3_singularity", False))
         self.dasiwa = bool(model_def.get("minimax_h3_dasiwa", False))
         self._baked_turbo = bool(model_def.get("minimax_h3_baked_turbo", False))
+        if self.dwd_steps and (
+            model_def.get("omni_reference")
+            or self.vdn
+            or self.fasth3
+            or self.hyperflow_flash
+            or self.pika_flex
+            or self._fused_turbo
+            or self.ptd_refasymopd
+            or self.singularity
+            or self.dasiwa
+            or self._baked_turbo
+            or self.audio_only
+            or self.viggle
+            or self.veda
+        ):
+            raise ValueError("pi-H3 DWD requires a dedicated FL2VA Frames model without another H3 variant.")
+        if self.dwd_steps and VAE_upsampling == X2_VAE_VALUE:
+            raise ValueError("pi-H3 DWD uses its trained pixel head and does not support VAE upsampling.")
         if self.singularity and self._fused_turbo:
             raise ValueError(
                 "MiniMax H3 Singularity uses a separate checkpoint and cannot be marked as fused Turbo."
@@ -1722,7 +1810,7 @@ class MiniMaxH3Model:
         self.sample_solver = str(
             model_def.get("minimax_h3_sampler") or "euler"
         ).strip().lower()
-        if self.fasth3 or self.pika_flex:
+        if self.fasth3 or self.pika_flex or self.hyperflow_flash:
             self.sample_solver = "euler"
         if self.pika_flex and (
             self.fasth3
@@ -1799,17 +1887,19 @@ class MiniMaxH3Model:
             )
             print(f"[MiniMax H3 Veda] Verified learned predictor: {veda_filename}")
         self.transformer = _load_transformer(
-            model_filename if self.vdn else transformer_path,
+            model_filename if self.vdn or self.dwd_steps else transformer_path,
             dtype,
             qkv_layout=qkv_layout,
             sla_config=model_def.get("sla_attention_config"),
             vdn=self.vdn,
+            dwd_steps=self.dwd_steps or None,
             singularity=self.singularity,
             dasiwa=self.dasiwa,
             import_profile=model_def.get("minimax_h3_import_profile"),
             veda_filename=veda_filename,
             fasth3=self.fasth3,
             fasth3_omniref=self.fasth3_omniref,
+            hyperflow_flash=self.hyperflow_flash,
         )
         from .viggle import load_conditioner
         self.conditioner = load_conditioner() if self.viggle else _load_conditioner(
@@ -1880,7 +1970,35 @@ class MiniMaxH3Model:
         # A retained model can be reused across jobs. Always restore its
         # ordinary heads before inspecting the next job's adapter selection.
         self.release_special_loras()
+        self._pi_h3_steps = self.dwd_steps or None
+        self._pi_h3_lora_path = None
+        selected_paths = [str(path) for path in (loras_selected or [])]
+        regular_pi = [
+            (path, pi_h3_adapter_steps(path))
+            for path in selected_paths
+            if pi_h3_adapter_steps(path) is not None
+        ]
+        dwd_pi = [
+            (path, pi_h3_dwd_adapter_steps(path))
+            for path in selected_paths
+            if pi_h3_dwd_adapter_steps(path) is not None
+        ]
+        if self.dwd_steps:
+            if len(dwd_pi) != 1 or dwd_pi[0][1] != self.dwd_steps or regular_pi:
+                raise ValueError(
+                    f"pi-H3 DWD requires its matching {self.dwd_steps}-step DWD LoRA and cannot use a regular pi-H3 adapter."
+                )
+            self._pi_h3_lora_path = dwd_pi[0][0]
+        elif dwd_pi:
+            raise ValueError("pi-H3 DWD LoRAs require their dedicated DWD model variant.")
+        elif len(regular_pi) > 1:
+            raise ValueError("MiniMax H3 supports only one pi-H3 LoRA at a time.")
+        elif regular_pi:
+            self._pi_h3_steps = regular_pi[0][1]
+            self._pi_h3_lora_path = regular_pi[0][0]
         if getattr(self, "pika_flex", False):
+            if self._pi_h3_steps is not None:
+                raise ValueError("pi-H3 uses its own trained schedule and cannot be combined with Pika H3 Flex.")
             from .pika_flex_lora_compatibility import validate_pika_flex_lora_selection
 
             validate_pika_flex_lora_selection(
@@ -1895,6 +2013,10 @@ class MiniMaxH3Model:
             self._pdd_lora_strength = 1.0
             self._ptd_lora_paths = ()
             return
+        if getattr(self, "minimax_h3_aligned_guide", False):
+            from .viggle_remake import validate_aligned_guide_loras
+
+            validate_aligned_guide_loras(loras_selected)
         if getattr(self, "fasth3", False):
             from .lora_compatibility import validate_fasth3_loras
 
@@ -1995,6 +2117,25 @@ class MiniMaxH3Model:
                 reference=self.omni_reference,
             )
             return
+        if getattr(self, "hyperflow_flash", False):
+            accelerator_loras = find_minimax_h3_accelerators(loras_selected or ())
+            if accelerator_loras:
+                names = ", ".join(os.path.basename(str(path)) for path in accelerator_loras)
+                raise ValueError(
+                    "HyperFlow Flash does not support H3 Turbo, PDD, or other "
+                    f"accelerator adapters ({names})."
+                )
+        if self._pi_h3_lora_path is not None:
+            selected = [str(path) for path in (loras_selected or [])]
+            try:
+                index = selected.index(self._pi_h3_lora_path)
+            except ValueError as error:
+                raise ValueError("MiniMax H3 pi-H3 adapter selection became inconsistent.") from error
+            values = list(multipliers or [])
+            strength = values[index] if index < len(values) else 1.0
+            weights = strength if isinstance(strength, (list, tuple)) else (strength,)
+            if not weights or any(float(weight) != 1.0 for weight in weights):
+                raise ValueError("pi-H3 uses its trained LoRA strength of 1.0.")
         for index, path in enumerate(loras_selected or []):
             preset = minimax_h3_turbo_preset_for_path(str(path)) or {}
             if not str(preset.get("id", "")).startswith(("hyperflow-", "dmad-")):
@@ -2493,7 +2634,7 @@ class MiniMaxH3Model:
         if self.sample_solver != "euler":
             raise ValueError("H3 Two-Pass currently requires the Euler sampler.")
         reason = two_pass_unavailable_reason(
-            self.model_def,
+            getattr(self, "model_def", {}),
             pdd_active=bool(self._pdd_lora_active or self.ptd_refasymopd),
             has_control_video=(
                 "G" in str(request.get("video_prompt_type") or "")
@@ -2677,6 +2818,7 @@ class MiniMaxH3Model:
     ):
         if not _audio_segment:
             self._interrupt = False
+        aligned_guide = bool(getattr(self, "minimax_h3_aligned_guide", False))
         if not isinstance(input_prompt, str):
             raise ValueError("MiniMax H3 accepts one text prompt per generation.")
         if getattr(self, "pika_flex", False):
@@ -2803,7 +2945,82 @@ class MiniMaxH3Model:
             phase2_clean_audio_timesteps,
         )
 
-        two_pass_settings = normalize_two_pass_settings(custom_settings)
+        model_def = getattr(self, "model_def", {}) or {}
+        hyperflow_flash = bool(getattr(self, "hyperflow_flash", False))
+        two_pass_settings = normalize_two_pass_settings(custom_settings, model_def)
+        pi_steps = self.dwd_steps or getattr(self, "_pi_h3_steps", None)
+        if pi_steps:
+            if int(sampling_steps) != int(pi_steps):
+                raise ValueError(
+                    f"pi-H3 requires exactly {pi_steps} denoising evaluations on its trained schedule."
+                )
+            if self.sample_solver != "euler" or str(_kwargs.get("sample_solver") or "euler").lower() != "euler":
+                raise ValueError("pi-H3 requires the Euler sampler.")
+            if int(_kwargs.get("guide_phases", _kwargs.get("guidance_phases", 1)) or 1) != 1:
+                raise ValueError("pi-H3 requires exactly one guidance phase.")
+            try:
+                guidance_scale = float(_kwargs.get("guidance_scale", 1.0) or 1.0)
+            except (TypeError, ValueError) as error:
+                raise ValueError("pi-H3 requires guidance scale 1.0.") from error
+            if guidance_scale != 1.0:
+                raise ValueError("pi-H3 requires guidance scale 1.0.")
+            requested_shift = _kwargs.get("flow_shift", _kwargs.get("shift"))
+            if requested_shift not in (None, ""):
+                try:
+                    if float(requested_shift) != 12.0:
+                        raise ValueError("pi-H3 requires video flow shift 12.")
+                except (TypeError, ValueError) as error:
+                    raise ValueError("pi-H3 requires video flow shift 12.") from error
+            requested_audio_shift = _kwargs.get("audio_flow_shift")
+            if requested_audio_shift not in (None, ""):
+                try:
+                    if float(requested_audio_shift) != 3.0:
+                        raise ValueError("pi-H3 requires the native H3 audio flow shift 3.")
+                except (TypeError, ValueError) as error:
+                    raise ValueError("pi-H3 requires the native H3 audio flow shift 3.") from error
+            raw_sigmas = _kwargs.get("custom_sigmas")
+            if raw_sigmas not in (None, ""):
+                if isinstance(raw_sigmas, str):
+                    values = [item.strip() for item in raw_sigmas.replace(";", ",").split(",") if item.strip()]
+                elif isinstance(raw_sigmas, (list, tuple)):
+                    values = list(raw_sigmas)
+                else:
+                    raise ValueError("pi-H3 custom sigmas must match its trained schedule.")
+                try:
+                    values = [float(value) for value in values]
+                except (TypeError, ValueError) as error:
+                    raise ValueError("pi-H3 custom sigmas must match its trained schedule.") from error
+                expected = pi_h3_sigmas(pi_steps, 12.0)
+                if len(values) != len(expected) or any(
+                    abs(actual - trained) > 1e-5
+                    for actual, trained in zip(values, expected)
+                ):
+                    raise ValueError("pi-H3 custom sigmas must match its trained schedule.")
+            try:
+                requested_denoising = float(denoising_strength)
+            except (TypeError, ValueError) as error:
+                raise ValueError("pi-H3 requires full denoising strength 1.0.") from error
+            if requested_denoising != 1.0:
+                raise ValueError("pi-H3 does not support partial-schedule denoising.")
+            if (
+                two_pass_settings[H3_TWO_PASS_ENABLED] == "on"
+                or _h3_two_pass_internal
+                or _h3_capture_latents
+                or _h3_initial_video_latents is not None
+                or _h3_initial_audio_latents is not None
+                or _h3_phase2_noise is not None
+                or _h3_phase2_accelerator_strength is not None
+                or _kwargs.get("starting_sigma") is not None
+                or _kwargs.get("refinement_mode")
+                or _kwargs.get("image_mode")
+                or (custom_settings or {}).get("audio_refinement") == "enabled"
+                or _face_refinement is not None
+                or getattr(self.transformer, "cache", None) is not None
+                or _kwargs.get("skip_steps_cache_type") not in (None, "")
+            ):
+                raise ValueError(
+                    "pi-H3 requires one full denoising pass without refinement, image mode, latent handoff, or step caching."
+                )
         if two_pass_settings[H3_TWO_PASS_ENABLED] == "on" and not _h3_two_pass_internal:
             from inspect import signature
 
@@ -2881,7 +3098,9 @@ class MiniMaxH3Model:
         if self.remake_mode is not None:
             from .viggle_remake import MAX_FRAMES, MIN_FRAMES, STEPS
 
-            if not MIN_FRAMES <= int(frame_num) <= MAX_FRAMES or int(sampling_steps) != STEPS:
+            if not MIN_FRAMES <= int(frame_num) <= MAX_FRAMES or (
+                not aligned_guide and int(sampling_steps) != STEPS
+            ):
                 raise ValueError("Viggle Remake requires six evaluations and a single 90–345 frame window.")
         if self.audio_only:
             from .voice_audio import audio_request
@@ -2933,8 +3152,34 @@ class MiniMaxH3Model:
                 f"MiniMax H3's selected duration limit is {minimum_duration:g}-{maximum_duration:g}s at 24 fps; "
                 f"the aligned request is {frame_num} frames ({duration:.3f}s)."
             )
-        if int(sampling_steps) < 2:
+        hyperflow_flash_phase2 = hyperflow_flash and _h3_initial_video_latents is not None
+        if int(sampling_steps) < 2 and not hyperflow_flash_phase2:
             raise ValueError("MiniMax H3 needs at least two scheduler grid points.")
+        if hyperflow_flash:
+            from .hyperflow_flash import HYPERFLOW_STEPS
+
+            allowed_steps = range(1, 9) if hyperflow_flash_phase2 else HYPERFLOW_STEPS
+            if int(sampling_steps) not in allowed_steps:
+                allowed = "1-8 phase-2" if hyperflow_flash_phase2 else "4, 6 or 8 phase-1"
+                raise ValueError(f"HyperFlow H3 Flash requires {allowed} evaluations.")
+            if self.sample_solver != "euler":
+                raise ValueError("HyperFlow H3 Flash requires the Euler sampler.")
+            if (
+                _h3_two_pass_internal is False
+                and int(_kwargs.get("guide_phases", _kwargs.get("guidance_phases", 1)) or 1) != 1
+            ):
+                raise ValueError("HyperFlow H3 Flash uses the H3 Two-Pass option for its second phase.")
+            if (
+                float(denoising_strength) != 1.0
+                or input_masks is not None
+                or outpainting_dims is not None
+                or _face_refinement is not None
+                or (custom_settings or {}).get("audio_refinement") == "enabled"
+                or getattr(self.transformer, "cache", None) is not None
+            ):
+                raise ValueError("HyperFlow H3 Flash requires full denoising without masks, refinement or step caching.")
+            if self._pdd_lora_active or self.ptd_refasymopd or self.fasth3 or self.vdn:
+                raise ValueError("HyperFlow H3 Flash cannot be combined with another fixed-schedule H3 accelerator.")
         if self._baked_turbo:
             profile = self.model_def.get("minimax_h3_import_profile")
             if profile:
@@ -3000,7 +3245,7 @@ class MiniMaxH3Model:
             if (
                 not self.omni_reference or self.audio_only or self.viggle
                 or self.pika_flex or self.fasth3 or self.vdn or self._baked_turbo
-                or self._pdd_lora_active or self.ptd_refasymopd
+                or self._pdd_lora_active or self.ptd_refasymopd or hyperflow_flash
                 or getattr(self, "dasiwa", False) or getattr(self, "singularity", False)
             ):
                 raise ValueError("HyperFlow requires standard Full or Pruned H3 Ref2VA.")
@@ -3035,6 +3280,29 @@ class MiniMaxH3Model:
 
         audio_prompt_type = str(audio_prompt_type or "")
         video_prompt_type = str(video_prompt_type or "")
+        if aligned_guide:
+            if video_prompt_type != "IVU2":
+                raise ValueError(
+                    "BFS Aligned Swap requires the IVU2 aligned-guide video mode."
+                )
+            if not self.omni_reference or self.remake_mode != "swap":
+                raise ValueError(
+                    "BFS Aligned Swap requires its Ref2VA character-swap profile."
+                )
+            if input_frames is None or input_ref_images is None or len(input_ref_images) != 1:
+                raise ValueError(
+                    "BFS Aligned Swap requires source-video frames and exactly one replacement identity image."
+                )
+            if (
+                input_masks is not None
+                or outpainting_dims is not None
+                or (frames_to_inject is not None and len(frames_to_inject) > 0)
+            ):
+                raise ValueError(
+                    "BFS Aligned Swap supports whole-shot aligned guidance without masks, outpainting, or timed injections."
+                )
+            if _h3_two_pass_internal or _h3_capture_latents or _h3_initial_video_latents is not None:
+                raise ValueError("BFS Aligned Swap does not support H3 Two-Pass or latent handoff.")
         denoising_strength = float(denoising_strength)
         masking_strength = float(masking_strength)
         if not 0.0 <= denoising_strength <= 1.0:
@@ -3145,6 +3413,7 @@ class MiniMaxH3Model:
         continuation_picture = None
         keyframes: list[Image.Image] = []
         visual_conditions: list[dict] = []
+        aligned_guide_condition = None
         history_video, boundary_video, continuation_count = (
             _split_continuation_video(
                 input_video,
@@ -3258,15 +3527,29 @@ class MiniMaxH3Model:
                 f"[MiniMax H3] Injecting {len(injected_conditions)} timed "
                 f"frame{suffix} into this window."
             )
+        if aligned_guide:
+            aligned_guide_condition = _aligned_guide_visual_condition(
+                input_frames,
+                history_count,
+                target_frame_num,
+                height,
+                width,
+            )
+            visual_conditions.append(aligned_guide_condition)
 
         request_seed = int(torch.seed() if seed is None else seed)
-        generator = torch.Generator(device=self.device).manual_seed(
+        # Match WanGP's pi-H3 noise stream so a seed selects the same noise on CUDA.
+        generator = torch.Generator(device="cpu" if pi_steps else self.device).manual_seed(
             request_seed + 7919 if self.pika_flex else request_seed
         )
         num_latent_frames = video_latent_num_frames(target_frame_num)
         latent_height = height // self.vae.spatial_compression_ratio
         latent_width = width // self.vae.spatial_compression_ratio
         num_audio_latents = audio_latent_num_frames(target_frame_num)
+        if pi_steps:
+            # The released recipe denoises five extra audio latents. Decoding
+            # below trims the waveform to the requested video duration.
+            num_audio_latents += PI_H3_AUDIO_TAIL_LATENTS
 
         target_video_condition_rows = None
         target_video_condition_frames = 0
@@ -3465,10 +3748,21 @@ class MiniMaxH3Model:
                 from .viggle_remake import prepare_references as prepare_remake_references, text_presentation
 
                 references = prepare_remake_references(
-                    input_frames, input_ref_images, history_count, frame_num, height, width,
+                    input_frames,
+                    input_ref_images,
+                    history_count,
+                    frame_num,
+                    height,
+                    width,
+                    aligned_guide=aligned_guide,
                 )
                 prompt_embeds, text_tags = self.conditioner(
-                    text_presentation(input_prompt, target_frame_num, len(references) - 1),
+                    text_presentation(
+                        input_prompt,
+                        target_frame_num,
+                        len(input_ref_images),
+                        aligned_guide=aligned_guide,
+                    ),
                     self.device,
                 )
                 if prompt_embeds is None or self._interrupt:
@@ -3618,6 +3912,17 @@ class MiniMaxH3Model:
                 height=height,
                 width=width,
             )
+            if aligned_guide:
+                expected_guide_latents = video_latent_num_frames(target_frame_num)
+                if (
+                    not anchors
+                    or anchors[-1][0] != "first"
+                    or anchors[-1][1] != expected_guide_latents
+                    or aligned_guide_condition is None
+                ):
+                    raise ValueError(
+                        "BFS Aligned Swap guide latents do not match the target frame grid."
+                    )
             reference_rows, reference_audio_rows = self._encode_references(
                 references,
                 generator,
@@ -3836,8 +4141,9 @@ class MiniMaxH3Model:
         if audio_condition_rows is not None:
             audio_rows = torch.cat([audio_condition_rows, audio_rows])
 
+        schedule_steps = max(2, int(sampling_steps)) if hyperflow_flash_phase2 else int(sampling_steps)
         scheduler_points = h3_scheduler_grid_points(
-            int(sampling_steps),
+            schedule_steps,
             turbo_active=self._turbo_lora_active,
         )
         # WanGP forwards flow_shift as `shift`, but also supplies a generic
@@ -3847,6 +4153,7 @@ class MiniMaxH3Model:
         fixed_schedule = bool(
             self.viggle
             or self.pika_flex
+            or pi_steps
             or self._fused_turbo
             or self.fasth3
             or self.vdn
@@ -3855,13 +4162,14 @@ class MiniMaxH3Model:
             or self.audio_only
             or self._pdd_lora_active
             or self.ptd_refasymopd
+            or hyperflow_flash
         )
         _set_h3_generation_shifts(
             self.scheduler,
             self.audio_scheduler,
             default_video_shift=self._default_video_shift,
             default_audio_shift=self._default_audio_shift,
-            model_def=self.model_def,
+            model_def=model_def,
             turbo_lora_paths=self._turbo_lora_paths,
             requested_video_shift=_kwargs.get("shift"),
             allow_video_shift_override=not fixed_schedule,
@@ -3869,15 +4177,68 @@ class MiniMaxH3Model:
         if dmad:
             self.scheduler.set_shift(12.0)
             self.audio_scheduler.set_shift(2.0)
-        self.scheduler.set_solver("euler" if dmad or hyperflow_tables is not None else self.sample_solver)
+        self.scheduler.set_solver("euler" if dmad or hyperflow_tables is not None or hyperflow_flash else self.sample_solver)
         self.scheduler.set_timesteps(scheduler_points, device=self.device)
         self.audio_scheduler.set_timesteps(scheduler_points, device=self.device)
-        if self.remake_mode is not None:
+        if pi_steps:
+            self.scheduler.set_solver("euler")
+            self.scheduler.set_shift(12.0)
+            self.audio_scheduler.set_shift(3.0)
+            self.scheduler.set_timesteps(
+                sigmas=[*pi_h3_sigmas(pi_steps, 12.0), 0.0],
+                device=self.device,
+            )
+            self.audio_scheduler.set_timesteps(
+                sigmas=_map_pi_h3_audio_sigmas(
+                    self.scheduler.sigmas,
+                    video_shift=12.0,
+                    audio_shift=3.0,
+                ),
+                device=self.device,
+            )
+            _scale_pi_h3_initial_noise(
+                video_rows,
+                audio_rows,
+                layout,
+                num_audio_latents=num_audio_latents,
+                audio_channels=MINIMAX_H3_AUDIO_CHANNELS,
+                video_sigma=self.scheduler.sigmas[0],
+                audio_sigma=self.audio_scheduler.sigmas[0],
+            )
+            print(
+                f"[pi-H3] Using the trained {pi_steps}-step FL2VA paired schedule "
+                "(Euler, video/audio shifts 12/3; initial target noise scaled)."
+            )
+        if self.remake_mode is not None and not aligned_guide:
             from .viggle_remake import sigmas as remake_sigmas
 
             self.scheduler.set_solver("euler")
             self.scheduler.set_timesteps(sigmas=remake_sigmas(self.remake_mode), device=self.device)
             self.audio_scheduler.set_timesteps(sigmas=remake_sigmas(self.remake_mode, 3.0), device=self.device)
+        if hyperflow_flash:
+            from .hyperflow_flash import (
+                HYPERFLOW_AUDIO_SHIFT,
+                HYPERFLOW_VIDEO_SHIFT,
+                phase2_tail_sigmas,
+                schedule_sigmas,
+            )
+
+            self.scheduler.set_shift(HYPERFLOW_VIDEO_SHIFT)
+            self.audio_scheduler.set_shift(HYPERFLOW_AUDIO_SHIFT)
+            if hyperflow_flash_phase2:
+                phase2_values = phase2_tail_sigmas(int(sampling_steps))
+                self.scheduler.set_timesteps(sigmas=phase2_values, device=self.device)
+                print(f"[MiniMax H3 HyperFlow Flash] Phase 2 uses {len(phase2_values) - 1} evaluations from the eight-step grid tail.")
+            else:
+                self.scheduler.set_timesteps(
+                    sigmas=schedule_sigmas(int(sampling_steps), HYPERFLOW_VIDEO_SHIFT),
+                    device=self.device,
+                )
+                self.audio_scheduler.set_timesteps(
+                    sigmas=schedule_sigmas(int(sampling_steps), HYPERFLOW_AUDIO_SHIFT),
+                    device=self.device,
+                )
+                print(f"[MiniMax H3 HyperFlow Flash] Phase 1 uses the native {int(sampling_steps)}-step Flash grids, shifts 12/3.")
         if hyperflow_tables is not None:
             steps = 3 if self.regenerate_ic else 8
             self.scheduler.set_shift(12.0)
@@ -3895,9 +4256,16 @@ class MiniMaxH3Model:
         if _h3_initial_video_latents is not None:
             from .two_pass import phase2_sigmas
 
-            phase2_values = phase2_sigmas(
-                int(sampling_steps), float(_h3_phase2_noise)
-            )
+            if hyperflow_flash:
+                from .hyperflow_flash import phase2_tail_sigmas
+
+                phase2_values = phase2_tail_sigmas(int(sampling_steps))
+                phase2_noise_level = float(phase2_values[0])
+            else:
+                phase2_values = phase2_sigmas(
+                    int(sampling_steps), float(_h3_phase2_noise)
+                )
+                phase2_noise_level = float(_h3_phase2_noise)
             self.scheduler.set_solver("euler")
             self.scheduler.set_timesteps(sigmas=phase2_values, device=self.device)
             phase2_generator = torch.Generator(device="cpu").manual_seed(
@@ -3915,7 +4283,7 @@ class MiniMaxH3Model:
             phase2_start = torch.lerp(
                 phase2_base,
                 phase2_noise,
-                float(_h3_phase2_noise),
+                phase2_noise_level,
             )
             video_rows[layout.num_condition_video_rows :].copy_(
                 patchify_video_latents(phase2_start, self.patch_size)
@@ -4145,7 +4513,12 @@ class MiniMaxH3Model:
 
         # Emit one concise line with the actual path used. This makes slow
         # user reports actionable without restoring noisy per-request logs.
-        first_block = self.transformer.blocks[0]
+        from .hyperflow_flash import DroppedBlock
+
+        first_block = next(
+            block for block in self.transformer.blocks
+            if not isinstance(block, DroppedBlock)
+        )
         qkv_mode = (
             "split"
             if hasattr(first_block.attn, "q_proj")
@@ -4190,10 +4563,16 @@ class MiniMaxH3Model:
         if callback is not None:
             callback(-1, None, True, override_num_inference_steps=len(timesteps))
         old_audio_denoised = None
-        res_multistep = self.sample_solver == "res_multistep" and not dmad and hyperflow_tables is None and self.remake_mode is None
+        res_multistep = (
+            self.sample_solver == "res_multistep"
+            and not dmad
+            and hyperflow_tables is None
+            and (self.remake_mode is None or aligned_guide)
+        )
         audio_scale = float(self.scheduler.shift) / float(
             self.audio_scheduler.shift
         )
+        dwd_video_pixels = None
         try:
             with tqdm(total=len(timesteps), desc="MiniMax H3 denoising") as progress:
                 for index, (video_timestep, audio_timestep) in enumerate(zip(timesteps, audio_timesteps)):
@@ -4237,7 +4616,22 @@ class MiniMaxH3Model:
                         unique_timesteps, timestep_indices = grouped_timesteps(
                             unique_timesteps, timestep_indices, layout, fixed_rows)
                     hyperflow_args = {}
-                    if hyperflow_tables is not None:
+                    if hyperflow_flash:
+                        endpoint_audio_sigma = (
+                            0.0
+                            if _h3_freeze_audio
+                            else float(self.audio_scheduler.sigmas[index + 1])
+                        )
+                        hyperflow_args = {
+                            "endpoint_sigmas": (
+                                float(self.scheduler.sigmas[index + 1]),
+                                endpoint_audio_sigma,
+                            ),
+                            "hyperflow_condition_video_timestep": max(
+                                float(video_timestep), MINIMAX_H3_KEYFRAME_NOISE_AUG
+                            ),
+                        }
+                    elif hyperflow_tables is not None:
                         unique_timesteps, timestep_indices, block_offsets, final_offset = step_conditioning(
                             hyperflow_tables, layout, unique_timesteps, timestep_indices,
                             next_video=1.0 - float(self.scheduler.sigmas[index + 1]),
@@ -4248,6 +4642,12 @@ class MiniMaxH3Model:
                             "hyperflow_block_offsets": block_offsets,
                             "hyperflow_final_offset": final_offset,
                         }
+                    dwd_step_final = bool(
+                        self.dwd_steps
+                        and index == len(timesteps) - 1
+                        and generated_video_row_count > 0
+                        and frozen_target_video is None
+                    )
                     prediction = self.transformer(
                         hidden_states=video_rows[None],
                         audio_hidden_states=audio_rows[None],
@@ -4259,7 +4659,7 @@ class MiniMaxH3Model:
                         video_indices=video_indices,
                         audio_indices=audio_indices,
                         text_indices=text_indices,
-                        return_dict=False,
+                        return_dict=dwd_step_final,
                         first_block_cache=first_block_cache,
                         target_start_index=target_start_index,
                         video_sink_tokens=video_sink_tokens,
@@ -4270,11 +4670,23 @@ class MiniMaxH3Model:
                         target_video_inverse_order=group_inverse,
                         condition_video_rows=layout.num_condition_video_rows,
                         veda_payload=veda_payload,
+                        dwd_convert=(
+                            (lambda pixels: self.vae._prepare_decoded_chunk(pixels, "truncate"))
+                            if dwd_step_final
+                            else None
+                        ),
                         **hyperflow_args,
                     )
                     if prediction is None or self._interrupt:
                         return None
-                    video_velocity, audio_velocity = prediction
+                    if dwd_step_final:
+                        video_velocity = prediction.sample
+                        audio_velocity = prediction.audio_sample
+                        dwd_video_pixels = prediction.dwd_video
+                        if dwd_video_pixels is None:
+                            raise RuntimeError("The pi-H3 DWD transformer did not return its decoded frames.")
+                    else:
+                        video_velocity, audio_velocity = prediction
                     preview_denoised_rows = None
                     if generated_video_row_count:
                         video_start = layout.num_condition_video_rows
@@ -4454,26 +4866,31 @@ class MiniMaxH3Model:
                 ),
             }
         if not self.audio_only and frozen_target_video is None:
-            video_latents = unpatchify_video_tokens(
-                video_rows[layout.num_condition_video_rows :],
-                num_latent_frames,
-                latent_height,
-                latent_width,
-                24,
-                self.patch_size,
-            )
-            video_mean = torch.tensor(VIDEO_LATENTS_MEAN, device=self.device).view(1, -1, 1, 1, 1)
-            video_std = torch.tensor(VIDEO_LATENTS_STD, device=self.device).view(1, -1, 1, 1, 1)
-            video_latents = video_latents * video_std + video_mean
-            autocast = (
-                torch.autocast(device_type="cuda", dtype=torch.float16)
-                if self.device.type == "cuda"
-                else nullcontext()
-            )
-            with autocast:
-                output_video = self.vae.decode_to_cpu_uint8(video_latents)[
-                    0, :, :target_frame_num
-                ]
+            if self.dwd_steps:
+                if dwd_video_pixels is None:
+                    raise RuntimeError("The pi-H3 DWD pixel head did not produce a video.")
+                output_video = dwd_video_pixels[0, :, :target_frame_num]
+            else:
+                video_latents = unpatchify_video_tokens(
+                    video_rows[layout.num_condition_video_rows :],
+                    num_latent_frames,
+                    latent_height,
+                    latent_width,
+                    24,
+                    self.patch_size,
+                )
+                video_mean = torch.tensor(VIDEO_LATENTS_MEAN, device=self.device).view(1, -1, 1, 1, 1)
+                video_std = torch.tensor(VIDEO_LATENTS_STD, device=self.device).view(1, -1, 1, 1, 1)
+                video_latents = video_latents * video_std + video_mean
+                autocast = (
+                    torch.autocast(device_type="cuda", dtype=torch.float16)
+                    if self.device.type == "cuda"
+                    else nullcontext()
+                )
+                with autocast:
+                    output_video = self.vae.decode_to_cpu_uint8(video_latents)[
+                        0, :, :target_frame_num
+                    ]
         elif not self.audio_only:
             output_video = _normalized_video_to_cpu_uint8(
                 frozen_target_video[:, :target_frame_num]

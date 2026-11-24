@@ -21,6 +21,11 @@ import sys
 # Importing a second copy would re-register the live Agent Access backend.
 if __name__ == "__main__":
     sys.modules["launch"] = sys.modules[__name__]
+    # A redirected Windows console can use a legacy code page. A prompt
+    # containing an unsupported character must still reach the model.
+    for _console_stream in (sys.stdout, sys.stderr):
+        if hasattr(_console_stream, "reconfigure"):
+            _console_stream.reconfigure(errors="backslashreplace")
 
 import os
 import glob
@@ -2882,6 +2887,15 @@ def _validate_h3_lora_selection(model_def: dict, params: dict) -> None:
         wgp.resolve_lora_path(params["model_type"], name) or name
         for name in params.get("activated_loras") or []
     ]
+    if model_def.get("minimax_h3_aligned_guide"):
+        from models.minimax_h3.viggle_remake import validate_aligned_guide_lora_names
+
+        validate_aligned_guide_lora_names(paths)
+    if model_def.get("minimax_h3_accelerators_allowed") is False:
+        from models.minimax_h3.turbo import find_minimax_h3_accelerators
+
+        if find_minimax_h3_accelerators(paths):
+            raise ValueError("H3 HyperFlow Flash uses its own step schedule and does not support accelerator LoRAs.")
     if model_def.get("minimax_h3_fasth3"):
         validate_fasth3_loras(
             paths, enabled=params.get("minimax_h3_experimental_loras"),
@@ -2897,6 +2911,7 @@ def _minimax_h3_turbo_option(model_def: dict) -> dict | None:
     architecture = str((model_def or {}).get("architecture") or "")
     if (
         not architecture.startswith("minimax_h3")
+        or (model_def or {}).get("minimax_h3_accelerators_allowed") is False
         or (model_def or {}).get("minimax_h3_fused_turbo", False)
         or (model_def or {}).get("minimax_h3_baked_turbo", False)
         or (model_def or {}).get("minimax_h3_fasth3", False)
@@ -7139,6 +7154,17 @@ def get_model_options(model_type: str):
         "architecture": md.get("architecture", model_type),
         "guidance_max_phases": md.get("guidance_max_phases", 1),
         "lock_guidance_phases": md.get("lock_guidance_phases", False),
+        # The maximum describes UI capability. The resolved settings file
+        # owns the selected phase count and second-expert handoff defaults.
+        "default_guidance_phases": _ui_defaults.get(
+            "guidance_phases", md.get("guidance_phases")
+        ),
+        "default_guidance2_scale": _ui_defaults.get(
+            "guidance2_scale", md.get("guidance2_scale")
+        ),
+        "default_switch_threshold": _ui_defaults.get(
+            "switch_threshold", md.get("switch_threshold")
+        ),
 
         # Boolean flags
         "sliding_window": md.get("sliding_window", False),
@@ -7376,22 +7402,42 @@ def _save_presets(presets: list[dict]):
 
 
 def _bundled_generation_presets():
-    """Expose shipped VDN profiles alongside the user's saved Studio presets."""
+    """Expose shipped H3 profiles alongside the user's saved Studio presets."""
+    profiles_dir = os.path.join(os.path.dirname(__file__), "profiles")
     presets = []
+
+    def add_preset(model_type, key, name, recipe):
+        loras = recipe["activated_loras"]
+        presets.append({
+            "id": f"builtin-{model_type}-{key}",
+            "name": name,
+            "mode": "video",
+            "model_type": model_type,
+            "prompt": "",
+            "builtin": True,
+            "activated_loras": loras,
+            "loras_multipliers": recipe["loras_multipliers"],
+            "lora_weights": {lora: [1.0] for lora in loras},
+            "created_at": 0,
+            "params": {**recipe, "minimax_h3_turbo_mode": False, "minimax_h3_turbo_preset": ""},
+        })
+
     for model_type in ("minimax_h3_vdn", "minimax_h3_vdn_full"):
-        path = os.path.join(os.path.dirname(__file__), "profiles", model_type, "VDN Turbo 8 Steps.json")
+        path = os.path.join(profiles_dir, model_type, "VDN Turbo 8 Steps.json")
         with open(path, encoding="utf-8") as reader:
             turbo = json.load(reader)
-        for key, name, recipe in (
-            ("standard", "VDN Standard 50 Steps", {**turbo, "activated_loras": [], "loras_multipliers": "", "num_inference_steps": 50}),
-            ("turbo8", "VDN Turbo 8 Steps", turbo),
-        ):
-            loras = recipe["activated_loras"]
-            presets.append({"id": f"builtin-{model_type}-{key}", "name": name,
-                "mode": "video", "model_type": model_type, "prompt": "", "builtin": True,
-                "activated_loras": loras, "loras_multipliers": recipe["loras_multipliers"],
-                "lora_weights": {lora: [1.0] for lora in loras}, "created_at": 0,
-                "params": {**recipe, "minimax_h3_turbo_mode": False, "minimax_h3_turbo_preset": ""}})
+        standard = {**turbo, "activated_loras": [], "loras_multipliers": "", "num_inference_steps": 50}
+        add_preset(model_type, "standard", "VDN Standard 50 Steps", standard)
+        add_preset(model_type, "turbo8", "VDN Turbo 8 Steps", turbo)
+
+    for steps in (2, 4):
+        name = f"pi-H3 FL2VA {steps} Steps"
+        path = os.path.join(profiles_dir, "minimax_h3_fl2va", f"{name}.json")
+        with open(path, encoding="utf-8") as reader:
+            recipe = json.load(reader)
+        for model_type in ("minimax_h3", "minimax_h3_full"):
+            add_preset(model_type, f"pi-h3-{steps}", name, recipe)
+
     return presets
 
 
@@ -7468,6 +7514,7 @@ def get_system_config():
     cfg = wgp.server_config
     from services.memory_settings import memory_settings_snapshot
     from services.memory_runtime import active_runtime_selection, runtime_snapshot
+    from shared import attention_kit
     from shared.cuda_memory import allocator_status
     runtime_selection = active_runtime_selection(
         _app_dir, getattr(wgp, "memory_runtime_selection", None)
@@ -7478,6 +7525,8 @@ def get_system_config():
         **runtime_snapshot(runtime_selection, cfg),
         "app_version": _APP_VERSION,
         "attention_mode": cfg.get("attention_mode", "auto"),
+        attention_kit.CHUNKER_CONFIG_KEY: attention_kit.current_chunker(),
+        "sagegp_first_step_precise": cfg.get("sagegp_first_step_precise", True),
         "transformer_quantization": cfg.get("transformer_quantization", "int8"),
         "vae_config": cfg.get("vae_config", 0),
         "compile": cfg.get("compile", ""),
@@ -7602,6 +7651,16 @@ async def update_system_config(request: Request):
 
     if "attention_mode" in body and body["attention_mode"] not in wgp.attention_modes_supported:
         raise HTTPException(status_code=400, detail="Invalid attention mode")
+    if "sagegp_first_step_precise" in body and not isinstance(body["sagegp_first_step_precise"], bool):
+        raise HTTPException(status_code=400, detail="SageGP first-step precision must be a boolean")
+    from shared import attention_kit
+    from shared.attention_chunking import normalize_mode as normalize_chunker_mode
+    chunker_key = attention_kit.CHUNKER_CONFIG_KEY
+    if chunker_key in body:
+        try:
+            body[chunker_key] = normalize_chunker_mode(body[chunker_key])
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
     if "transformer_quantization" in body and body["transformer_quantization"] not in ("int8", "fp8", "bf16"):
         raise HTTPException(status_code=400, detail="Invalid transformer quantization")
     if "vae_config" in body and (
@@ -7633,7 +7692,7 @@ async def update_system_config(request: Request):
             raise HTTPException(status_code=400, detail="VRAM safety coefficient must be from 0.50 to 0.95")
 
     ALLOWED_KEYS = {
-        "attention_mode", "transformer_quantization", "vae_config",
+        "attention_mode", chunker_key, "sagegp_first_step_precise", "transformer_quantization", "vae_config",
         "compile", "video_profile", "image_profile", "audio_profile",
         "video_output_codec", "image_output_codec",
         "enhancer_enabled", "prompt_enhancer_quantization",
@@ -7712,6 +7771,8 @@ async def update_system_config(request: Request):
     # Apply runtime side effects where possible
     if "attention_mode" in updated:
         wgp.attention_mode = updated["attention_mode"]
+    if chunker_key in updated:
+        attention_kit.configure_chunker(updated[chunker_key])
     if "vae_config" in updated:
         wgp.vae_config = updated["vae_config"]
     if "compile" in updated:
@@ -8256,12 +8317,13 @@ def get_recipe_route(rid: str):
 
 
 @api.get("/api/v1/recipes/{rid}/thumbnail")
-def get_recipe_thumbnail_route(rid: str):
+def get_recipe_thumbnail_route(rid: str, preview: bool = False):
     from services import recipes
-    path = recipes.get_recipe_thumbnail_path(rid)
+    get_recipe_route(rid)
+    path = recipes.get_recipe_preview_path(rid) if preview else recipes.get_recipe_thumbnail_path(rid)
     if not path:
-        raise HTTPException(status_code=404, detail="No thumbnail")
-    return FileResponse(path, media_type="image/jpeg")
+        raise HTTPException(status_code=404, detail="No recipe preview" if preview else "No thumbnail")
+    return FileResponse(path, media_type="video/mp4" if preview else "image/jpeg")
 
 
 @api.post("/api/v1/recipes/save-from-output")
@@ -12184,6 +12246,7 @@ def _enqueue_deferred_generation_preparation(body: dict) -> dict:
         "progress": 0,
         "step": 0,
         "total_steps": 0,
+        "seconds_per_step": None,
         "phase": "",
         "generation_engine_snapshot": engine_snapshot,
         "message": (
@@ -12323,6 +12386,54 @@ def _reviewed_h3_runtime_geometry_error(
     )
 
 
+def _h3_ref2va_queue_speaker_error(queue: list[dict]) -> str | None:
+    """Validate prepared Omni windows across all tasks before any rendering."""
+    from models.minimax_h3.reference_handoff import validate_ref2va_window_prompts
+    from models.minimax_h3.speakers import H3SpeakerBindingError
+
+    window_count = 0
+    for task in queue:
+        params = task["params"]
+        model_def = wgp.get_model_def(params.get("model_type")) or {}
+        if (
+            not str(model_def.get("architecture") or "").startswith("minimax_h3")
+            or not model_def.get("omni_reference")
+            or model_def.get("minimax_h3_viggle")
+            or model_def.get("minimax_h3_audio_only")
+        ):
+            continue
+
+        window_prompts = params.get("h3_window_prompts")
+        if not isinstance(window_prompts, (list, tuple)):
+            continue
+        prompts = [
+            prompt.strip()
+            for prompt in window_prompts
+            if isinstance(prompt, str) and prompt.strip()
+        ]
+        if not prompts:
+            continue
+
+        references = params.get("minimax_h3_runtime_references")
+        if references is None:
+            references = params.get("minimax_h3_references")
+        audio_flags = str(params.get("audio_prompt_type") or "")
+        try:
+            validate_ref2va_window_prompts(
+                prompts,
+                references,
+                first_window=window_count + 1,
+                exact_drive_audio="D" in audio_flags and any(flag in audio_flags for flag in "AK"),
+                drive_audio_ordinal=params.get("minimax_h3_exact_drive_audio_ordinal"),
+            )
+        except H3SpeakerBindingError as error:
+            return f"{error} No windows were rendered."
+        window_count += len(prompts)
+    if window_count > 1:
+        print(f"[MiniMax H3 Ref2VA] Validated speaker bindings for all {window_count} planned windows.")
+    return None
+
+
 def _generation_sidecar_params(
     params: dict,
     *,
@@ -12333,12 +12444,18 @@ def _generation_sidecar_params(
 
     from services.director_clip_settings import json_safe_generation_params
 
-    return json_safe_generation_params(
+    safe_params = json_safe_generation_params(
         params,
         path_params=path_params,
         attachment_keys=attachment_keys,
-        omit_keys={"_reviewed_h3_runtime_geometry"},
+        omit_keys={"_reviewed_h3_runtime_geometry", "_h3_output_audio_path"},
     )
+    # Per-clip runtime audio paths live inside this scheduling record. The
+    # source-shaped H3 manifest is already preserved separately for retries.
+    multi_clip = safe_params.get("multi_clip_info")
+    if params.get("_h3_output_audio_path") and isinstance(multi_clip, dict):
+        multi_clip.pop("concat_audio_path", None)
+    return safe_params
 
 
 def _director_clip_sidecar_timing(
@@ -12446,6 +12563,9 @@ async def _prepare_generation_submission(
     """Normalize/plan a request, then submit it or return prepared params."""
 
     body = dict(body)
+    # This path is created only from a validated H3 reference below. Never
+    # trust a caller-supplied internal output-audio path.
+    body.pop("_h3_output_audio_path", None)
     # Only the generation worker may supply recognized source text to the
     # runtime. Clients select opt-in flags and a driver, never internal ASR data.
     body.pop("source_audio_transcript_data", None)
@@ -12513,7 +12633,12 @@ async def _prepare_generation_submission(
         elif _generation_model_def.get("minimax_h3_viggle_remake"):
             from models.minimax_h3.viggle_remake import normalize_request
 
-            normalize_request(body)
+            normalize_request(
+                body,
+                aligned_guide=bool(
+                    _generation_model_def.get("minimax_h3_aligned_guide")
+                ),
+            )
         elif _generation_model_def.get("minimax_h3_regenerate_ic"):
             from models.minimax_h3.regenerate_ic import normalize_request
 
@@ -12596,7 +12721,10 @@ async def _prepare_generation_submission(
             )
     source_audio_transcript = (await _source_audio_enhancement_transcript(body)
                                if body.get("source_audio_transcript_for_enhancement") is True else None)
-    if _generation_model_def.get("omni_reference"):
+    if (
+        _generation_model_def.get("omni_reference")
+        and not _generation_model_def.get("minimax_h3_aligned_guide")
+    ):
         from models.minimax_h3.ref2va import (
             normalize_reference_detail,
             validate_reference_manifest,
@@ -12624,16 +12752,82 @@ async def _prepare_generation_submission(
                     body.get("minimax_h3_references"),
                     require_files=True,
                 )
-            from services.h3_reference_audio import measure_video_audio_metadata
+            from services.h3_reference_audio import (
+                measure_video_audio_metadata,
+                resolve_output_only_audio_path,
+            )
             if per_clip_references is not None:
                 body["per_clip_minimax_h3_references"] = [
                     await asyncio.to_thread(measure_video_audio_metadata, manifest)
                     for manifest in body["per_clip_minimax_h3_references"]
                 ]
+                output_audio_manifests = body["per_clip_minimax_h3_references"]
             else:
                 body["minimax_h3_references"] = await asyncio.to_thread(
                     measure_video_audio_metadata, body["minimax_h3_references"]
                 )
+                output_audio_manifests = body["minimax_h3_references"]
+            output_only_audio_path = await asyncio.to_thread(
+                resolve_output_only_audio_path,
+                output_audio_manifests,
+            )
+            if output_only_audio_path:
+                # The selected reference soundtrack is an output-only source.
+                # Keep its extracted WAV private to this request; the original
+                # source-shaped references remain the saved/retry contract.
+                audio_flags = str(body.get("audio_prompt_type") or "").strip()
+                if audio_flags == "AD" and bool(
+                    body.get("audio_guide") or body.get("input_waveform")
+                ):
+                    selected_source_paths = {
+                        os.path.normcase(os.path.realpath(output_only_audio_path)),
+                    }
+                    source_manifests = (
+                        output_audio_manifests
+                        if output_audio_manifests and isinstance(output_audio_manifests[0], list)
+                        else [output_audio_manifests]
+                    )
+                    for manifest in source_manifests:
+                        for reference in manifest:
+                            if not isinstance(reference, dict):
+                                continue
+                            if (
+                                str(reference.get("type") or reference.get("kind") or "").strip().lower()
+                                != "video"
+                                or str(reference.get("video_audio_role") or "").strip().lower()
+                                != "output_only"
+                            ):
+                                continue
+                            for source_key in ("path", "audio_path"):
+                                source_path = str(reference.get(source_key) or "").strip()
+                                if source_path:
+                                    selected_source_paths.add(
+                                        os.path.normcase(os.path.realpath(source_path))
+                                    )
+                    guide_path = str(body.get("audio_guide") or "").strip()
+                    same_selected_source = bool(
+                        guide_path
+                        and os.path.normcase(os.path.realpath(guide_path)) in selected_source_paths
+                    )
+                    if not same_selected_source:
+                        raise ValueError(
+                            "Keep source audio (output only) cannot be combined with "
+                            "a separate Frames Music / performance soundtrack. Choose one output soundtrack."
+                        )
+                    # Older saved Drive settings can leave this exact same
+                    # reference in the canonical Frames guide. Drop only that
+                    # stale copy so it does not enter H3 conditioning; a
+                    # different explicit soundtrack above remains an error.
+                    body.pop("audio_guide", None)
+                    body.pop("input_waveform", None)
+                    body["audio_prompt_type"] = ""
+                # The reference-selected track is authoritative for this
+                # request. A stale concat soundtrack from older settings must
+                # not override it or be retained alongside its derived path.
+                body.pop("multi_clip_concat_audio", None)
+                body["_h3_output_audio_path"] = output_only_audio_path
+            else:
+                body.pop("_h3_output_audio_path", None)
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
     if (
@@ -12721,6 +12915,40 @@ async def _prepare_generation_submission(
             resolve_h3_long_sequence_discard_frames,
             validate_pika_flex_single_pass_request,
         )
+
+        if (
+            _generation_model_def.get("omni_reference")
+            and not _generation_model_def.get("minimax_h3_aligned_guide")
+        ):
+            from models.minimax_h3.reference_manifest import (
+                split_exact_drive_audio_reference,
+            )
+
+            try:
+                _, typed_drive_path, _ = await asyncio.to_thread(
+                    split_exact_drive_audio_reference,
+                    body.get("minimax_h3_references") or [],
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+            if typed_drive_path:
+                # Typed References media is authoritative over any stale
+                # Frames soundtrack or legacy audio flag in the request.
+                body["audio_prompt_type"] = "AD"
+                body["audio_guide"] = typed_drive_path
+                body.pop("input_waveform", None)
+            else:
+                legacy_exact_drive = (
+                    str(body.get("audio_prompt_type") or "").strip() == "AD"
+                    and bool(body.get("audio_guide") or body.get("input_waveform"))
+                )
+                if not legacy_exact_drive:
+                    # References use the typed manifest. A leftover Frames
+                    # soundtrack is not a valid source unless the caller
+                    # explicitly supplied the legacy AD exact-drive contract.
+                    body.pop("audio_guide", None)
+                    body.pop("input_waveform", None)
+                    body["audio_prompt_type"] = ""
 
         try:
             # Reject unsupported explicit continuation requests before the
@@ -13267,7 +13495,10 @@ async def _prepare_generation_submission(
                     f"{unload_error}"
                 )
 
-        if _generation_model_def.get("omni_reference"):
+        if (
+            _generation_model_def.get("omni_reference")
+            and not _generation_model_def.get("minimax_h3_aligned_guide")
+        ):
             from models.minimax_h3.reference_manifest import (
                 split_exact_drive_audio_reference,
             )
@@ -13937,8 +14168,10 @@ async def _prepare_generation_submission(
     job_out_dir = _workspace_dir(workspace)
 
     if prepare_only:
+        prepared_params = dict(body)
+        prepared_params.pop("_h3_output_audio_path", None)
         return {
-            "params": body,
+            "params": prepared_params,
             "workspace": workspace,
             "out_dir": job_out_dir,
             "h3_window_plan": h3_window_plan_response,
@@ -13961,6 +14194,7 @@ async def _prepare_generation_submission(
         "progress": 0,
         "step": 0,
         "total_steps": 0,
+        "seconds_per_step": None,
         "phase": "",
         "generation_engine_snapshot": engine_snapshot,
         "message": (
@@ -14323,6 +14557,28 @@ for _turbo_preset in MINIMAX_H3_TURBO_PRESETS:
             or f"https://huggingface.co/{_turbo_repo_id}"
         ),
     }
+
+
+from models.minimax_h3.viggle_remake import (
+    ALIGNED_GUIDE_LORA_FILE,
+    ALIGNED_GUIDE_LORA_REPO,
+    ALIGNED_GUIDE_LORA_REVISION,
+    ALIGNED_GUIDE_LORA_SHA256,
+    ALIGNED_GUIDE_LORA_SIZE,
+)
+
+_MANAGED_LORAS[ALIGNED_GUIDE_LORA_FILE] = {
+    "repo_id": ALIGNED_GUIDE_LORA_REPO,
+    "revision": ALIGNED_GUIDE_LORA_REVISION,
+    "remote_path": f"loras/{ALIGNED_GUIDE_LORA_FILE}",
+    "sha256": ALIGNED_GUIDE_LORA_SHA256,
+    "size": ALIGNED_GUIDE_LORA_SIZE,
+    "label": "BFS Aligned Swap character adapter",
+    "support_url": (
+        f"https://huggingface.co/{ALIGNED_GUIDE_LORA_REPO}/blob/"
+        f"{ALIGNED_GUIDE_LORA_REVISION}/loras/{ALIGNED_GUIDE_LORA_FILE}"
+    ),
+}
 
 
 def _ensure_managed_loras_present(activated_loras, model_type, progress=None):
@@ -26928,12 +27184,19 @@ def _run_tool_revoice(job_id: str):
                     abort_check=lambda: bool(abort_state.get("abort")) or is_cancel_requested(job),
                 )
 
+            singing = bool(params.get("singing"))
             mode = params.get("mode", "single")
             voice_refs = []
             for ref in (params.get("voice_ref_paths") or []):
                 resolved = _resolve_tool_clip_path(ref, workspace)
                 if resolved:
                     voice_refs.append(resolved)
+            if singing and len(voice_refs) != len(params.get("voice_ref_paths") or []):
+                finish_job(
+                    job, "failed", error="A selected singer's voice sample was not found",
+                    message="Attach the missing voice sample and try again",
+                )
+                return False
             if not voice_refs:
                 finish_job(
                     job, "failed", error="No voice reference found",
@@ -26943,11 +27206,13 @@ def _run_tool_revoice(job_id: str):
 
             # Copy source -> new output, then revoice the copy in place so the
             # original gallery clip is never modified.
-            src_ext = os.path.splitext(original_video_source or video_source)[1] or ".mp4"
-            final_path = wgp.get_available_filename(out_dir, source_name, "_revoiced", force_extension=src_ext)
+            src_ext = ".wav" if singing else os.path.splitext(original_video_source or video_source)[1] or ".mp4"
+            suffix = "_sung" if singing else "_revoiced"
+            final_path = wgp.get_available_filename(out_dir, source_name, suffix, force_extension=src_ext)
             if is_cancel_requested(job):
                 return False
-            shutil.copyfile(video_source, final_path)
+            if not singing:
+                shutil.copyfile(video_source, final_path)
             if is_cancel_requested(job):
                 try:
                     os.remove(final_path)
@@ -26957,7 +27222,7 @@ def _run_tool_revoice(job_id: str):
 
             if not update_job(
                 job,
-                message="Replacing voice (SeedVC)...",
+                message="Converting singing and preserving the instrumental..." if singing else "Replacing voice (SeedVC)...",
                 phase="Voice Conversion",
                 progress=10,
             ):
@@ -26969,9 +27234,10 @@ def _run_tool_revoice(job_id: str):
 
             from postprocessing.voice_clone import apply_voice_clone_to_file
             ok = apply_voice_clone_to_file(
-                final_path, voice_refs, mode=mode,
+                video_source if singing else final_path, voice_refs, mode=mode,
                 diffusion_steps=int(params.get("diffusion_steps", 25)),
                 cfg_rate=float(params.get("cfg_rate", 0.5)),
+                **({"singing_output": final_path} if singing else {}),
             )
             if is_cancel_requested(job):
                 try:
@@ -27006,6 +27272,7 @@ def _run_tool_revoice(job_id: str):
                 tool="revoice",
                 params={
                     "mode": mode,
+                    "singing": singing,
                     "voice_ref_paths": voice_refs,
                     "diffusion_steps": int(params.get("diffusion_steps", 25)),
                     "cfg_rate": float(params.get("cfg_rate", 0.5)),
@@ -27372,6 +27639,16 @@ async def media_flow_submit(request: Request):
     return _enqueue_media_flow(await request.json())
 
 
+from services.director_showrunner import create_director_showrunner_router
+
+api.include_router(create_director_showrunner_router(
+    authorize_pipeline=_agent_require_director_pipeline,
+    initialize_pipeline=_init_pipeline,
+    get_output_dir=lambda: wgp.server_config.get("save_path", "outputs"),
+    enqueue_media_flow=_enqueue_media_flow,
+))
+
+
 @api.post("/api/v1/media-flow/outpaint")
 async def media_flow_outpaint(request: Request):
     """Batch the existing Outpaint workflow, with per-file queue results."""
@@ -27570,8 +27847,9 @@ async def tools_revoice(request: Request):
     """Replace the voice(s) in an existing clip via SeedVC. Returns a job_id.
 
     Body: { video_path: str, voice_ref_paths: [str, ...],
-            mode?: "single"|"two", diffusion_steps?: int, cfg_rate?: float,
-            workspace?: str }
+            mode?: "single"|"two", singing?: bool, diffusion_steps?: int,
+            cfg_rate?: float, workspace?: str }
+    With singing=true, video_path is an audio file and the job saves a new WAV.
     """
     body = await request.json()
     existing_editor_job = _existing_editor_operation_job(body, expected_tool="revoice")
@@ -27592,8 +27870,18 @@ async def tools_revoice(request: Request):
     if not voice_refs:
         raise HTTPException(status_code=400, detail="At least one voice_ref_path is required")
 
-    mode = body.get("mode", "single")
-    if mode not in ("single", "two"):
+    singing = body.get("singing", False)
+    if not isinstance(singing, bool):
+        raise HTTPException(status_code=400, detail="singing must be a boolean")
+    if singing:
+        if correlation:
+            raise HTTPException(status_code=400, detail="Use a soundtrack to convert singing in Director")
+        if os.path.splitext(resolved)[1].lower() not in {".wav", ".mp3", ".m4a", ".ogg", ".aac", ".flac", ".opus"}:
+            raise HTTPException(status_code=400, detail="Choose an uploaded or generated song")
+        if not isinstance(voice_refs, list) or not 1 <= len(voice_refs) <= 2:
+            raise HTTPException(status_code=400, detail="Choose one singer or two singers in first-heard order")
+    mode = "two" if singing and len(voice_refs) == 2 else body.get("mode", "single")
+    if (singing and len(voice_refs) == 1) or mode not in ("single", "two"):
         mode = "single"
 
     job_id = uuid.uuid4().hex[:8]
@@ -27606,8 +27894,9 @@ async def tools_revoice(request: Request):
             "video_path": resolved,
             "voice_ref_paths": voice_refs,
             "mode": mode,
-            "diffusion_steps": body.get("diffusion_steps", 25),
-            "cfg_rate": body.get("cfg_rate", 0.5),
+            "singing": singing,
+            "diffusion_steps": body.get("diffusion_steps", 10 if singing else 25),
+            "cfg_rate": body.get("cfg_rate", 0.7 if singing else 0.5),
         },
         "output_files": [], "error": None,
         "workspace": workspace, "out_dir": _workspace_dir(workspace),
@@ -28043,7 +28332,13 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                 from functools import partial
                 from models.minimax_h3.viggle_remake import prepare_remake_media
 
-                prepare_media = partial(prepare_remake_media, mode=media_definition["minimax_h3_viggle_remake"])
+                prepare_media = partial(
+                    prepare_remake_media,
+                    mode=media_definition["minimax_h3_viggle_remake"],
+                    aligned_guide=bool(
+                        media_definition.get("minimax_h3_aligned_guide")
+                    ),
+                )
             elif media_definition.get("minimax_h3_regenerate_ic"):
                 from models.minimax_h3.regenerate_ic import prepare_media
             if prepare_media is not None:
@@ -28403,8 +28698,15 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                 per_clip_continuations = raw_params.pop(
                     "per_clip_continue_from_previous", None,
                 )
-                multi_clip_concat_audio = raw_params.pop(
+                configured_multi_clip_audio = raw_params.pop(
                     "multi_clip_concat_audio", None,
+                )
+                # Rejoin per-clip H3 outputs against the complete output-only
+                # reference soundtrack. Individual clip renders already slice
+                # this same WAV by audio_frame_offset for their own muxes.
+                multi_clip_concat_audio = (
+                    raw_params.get("_h3_output_audio_path")
+                    or configured_multi_clip_audio
                 )
                 multi_clip_audio_start_sec = raw_params.pop("multi_clip_audio_start_sec", 0.0)
                 omni_sequence_continuity = bool(
@@ -28765,8 +29067,8 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                     reviewed_runtime_geometry,
                     queue[0].get("params") or {},
                 )
-                if error:
-                    queue = []
+                if not error:
+                    error = _h3_ref2va_queue_speaker_error(queue)
 
             if error:
                 finish_job(
@@ -29348,6 +29650,9 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                 # Process stream — update job dict with live progress
                 task_error = False
                 task_generation_time = None
+                from services.studio_step_timing import StudioStepTiming
+
+                step_timing = StudioStepTiming()
                 task_window_generation_seconds: list[int] = []
                 task_window_total = 1
                 task_last_cumulative_generation_seconds = 0
@@ -29372,6 +29677,9 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                             if isinstance(data[0], tuple):
                                 step, total = data[0]
                                 msg = data[1] if len(data) > 1 else ""
+                                progress_updates["seconds_per_step"] = step_timing.observe(
+                                    step, total, msg, now=time.monotonic(),
+                                )
                                 # For TTS: extract progress from message
                                 # Multi-speaker: "Segment 26/51" — use segment count
                                 # Single-speaker: "45/600 s" — show seconds, use indeterminate progress
@@ -29436,7 +29744,10 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                                 step = 0
                                 msg = data[1] if len(data) > 1 else str(data[0])
                                 total = 0
-                                progress_updates.update(step=0, total_steps=0)
+                                step_timing.reset()
+                                progress_updates.update(
+                                    step=0, total_steps=0, seconds_per_step=None,
+                                )
                                 if generation_eta is not None:
                                     progress_updates.update(_eta_job_updates(
                                         generation_eta.observe_status(
@@ -29452,11 +29763,13 @@ def _run_generation(job_id: str, *, finalize: bool = True, _slot_owned: bool = F
                             last_msg_len = len(status_line)
                             in_status_line = True
                     elif cmd == "status":
+                        step_timing.reset()
                         status_updates = {
                             "message": str(data),
                             "phase": str(data),
                             "step": 0,
                             "total_steps": 0,
+                            "seconds_per_step": None,
                             "progress": 0,
                         }
                         if generation_eta is not None:
@@ -31614,6 +31927,7 @@ def get_status(job_id: str):
         "progress": j["progress"],
         "step": j.get("step", 0),
         "total_steps": j.get("total_steps", 0),
+        "seconds_per_step": j.get("seconds_per_step"),
         "phase": j.get("phase", ""),
         "message": j["message"],
         "output_files": j.get("output_files", []),
@@ -31954,6 +32268,7 @@ def list_jobs():
                 "progress": j["progress"],
                 "step": j.get("step", 0),
                 "total_steps": j.get("total_steps", 0),
+                "seconds_per_step": j.get("seconds_per_step"),
                 "phase": j.get("phase", ""),
                 "message": j["message"],
                 "output_files": j["output_files"],

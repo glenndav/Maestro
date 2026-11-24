@@ -89,6 +89,8 @@ export interface ApiJobStatus {
   progress: number
   step: number
   total_steps: number
+  /** Average time per completed denoising step in the active pass. */
+  seconds_per_step?: number | null
   phase: string
   message: string
   output_files: string[]
@@ -504,6 +506,7 @@ export async function submitToolRevoice(params: {
   video_path: string
   voice_ref_paths: string[]
   mode?: 'single' | 'two'
+  singing?: boolean
   diffusion_steps?: number
   cfg_rate?: number
   workspace?: string
@@ -1227,6 +1230,17 @@ export interface RecipeLora {
   size_mb?: number
 }
 
+export type RecipeWorkflowStepType =
+  | 'prepare_prompt' | 'configure' | 'verify_requirements' | 'generate' | 'review' | 'iterate'
+
+export interface RecipeWorkflowStep {
+  type: RecipeWorkflowStepType
+  title: string
+  instruction: string
+  setting?: string
+  value?: string | number | boolean | null
+}
+
 export interface RecipeCard {
   id: string
   name: string
@@ -1238,11 +1252,17 @@ export interface RecipeCard {
   nsfw: boolean
   source: 'bundled' | 'user'
   thumbnail_url: string | null
+  preview_url: string | null
 }
 
 export interface Recipe extends RecipeCard {
   loras: RecipeLora[]
   params: Record<string, unknown>
+  requirements: string[]
+  model_guidance: string
+  prompt_guidance: string
+  workflow_guidance: string
+  workflow_steps: RecipeWorkflowStep[]
 }
 
 export async function fetchRecipes(): Promise<{ recipes: RecipeCard[] }> {
@@ -1332,6 +1352,7 @@ export async function updateClipPrompt(pid: string, clipIndex: number, update: {
   image_prompt?: string
   video_prompt?: string
   window_prompts?: string[]
+  shot_reference_cast?: string[] | null
 }): Promise<void> {
   const res = await fetch(`${BASE}/api/v1/director/pipelines/${encodeURIComponent(pid)}/clips/${clipIndex}/prompt`, {
     method: 'PUT',

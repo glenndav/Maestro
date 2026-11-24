@@ -2134,6 +2134,38 @@ def enforce_h3_source_continuation_prompt(prompt):
     )
 
 
+def _apply_dwd_recipe_settings(ui_defaults, model_def):
+    """Repair saved controls to the dedicated DWD model's trained recipe."""
+    try:
+        steps = int((model_def or {}).get("dwd", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    if steps not in (2, 4):
+        return
+    ui_defaults.update(
+        {
+            "num_inference_steps": steps,
+            "guidance_phases": 1,
+            "guidance_scale": 1.0,
+            "flow_shift": 12.0,
+            "audio_flow_shift": 3.0,
+            "sample_solver": "euler",
+            "denoising_strength": 1.0,
+            "minimax_h3_turbo_mode": False,
+            "minimax_h3_turbo_preset": "",
+            "skip_steps_cache_type": "",
+            "custom_sigmas": "",
+        }
+    )
+    custom = ui_defaults.get("custom_settings")
+    custom = dict(custom) if isinstance(custom, dict) else {}
+    custom["audio_refinement"] = "none"
+    from .two_pass import H3_TWO_PASS_ENABLED
+
+    custom[H3_TWO_PASS_ENABLED] = "off"
+    ui_defaults["custom_settings"] = custom
+
+
 class family_handler:
     @staticmethod
     def query_supported_types():
@@ -2145,6 +2177,7 @@ class family_handler:
             _TTS_MODEL_TYPE,
             "viggle_animate",
             "viggle_remake_swap",
+            "viggle_remake_swap_aligned",
             "viggle_remake_edit",
             "minimax_h3_regenerate_ic",
         ]
@@ -2191,12 +2224,20 @@ class family_handler:
             from models.minimax_h3.regenerate_ic import model_definition
 
             return model_definition(family_handler.query_model_def(_REF2VA_MODEL_TYPE, model_def))
-        if base_model_type in {"viggle_remake_swap", "viggle_remake_edit"}:
+        if base_model_type in {
+            "viggle_remake_swap",
+            "viggle_remake_swap_aligned",
+            "viggle_remake_edit",
+        }:
             from models.minimax_h3.viggle_remake import model_definition
 
+            aligned_guide = base_model_type == "viggle_remake_swap_aligned"
             return model_definition(
-                family_handler.query_model_def(_MODEL_TYPE, model_def),
-                base_model_type.removeprefix("viggle_remake_"),
+                family_handler.query_model_def(
+                    _REF2VA_MODEL_TYPE if aligned_guide else _MODEL_TYPE,
+                    model_def,
+                ),
+                "swap_aligned" if aligned_guide else base_model_type.removeprefix("viggle_remake_"),
             )
         if base_model_type == "viggle_animate":
             from models.minimax_h3.viggle import model_definition
@@ -2222,6 +2263,17 @@ class family_handler:
         fused_turbo = bool(
             (model_def or {}).get("minimax_h3_fused_turbo", False)
         )
+        raw_dwd_steps = (model_def or {}).get("dwd", 0)
+        try:
+            dwd_steps = int(raw_dwd_steps or 0)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "MiniMax H3 DWD must declare its trained 2-step or 4-step schedule."
+            ) from error
+        if dwd_steps not in (0, 2, 4):
+            raise ValueError(
+                "MiniMax H3 DWD is available only in its trained 2-step or 4-step variants."
+            )
         vdn = bool((model_def or {}).get("vdn", False))
         ptd_refasymopd = bool(
             (model_def or {}).get(
@@ -2230,6 +2282,7 @@ class family_handler:
             )
         )
         fasth3 = bool((model_def or {}).get("minimax_h3_fasth3", False))
+        hyperflow_flash = bool((model_def or {}).get("minimax_h3_hyperflow_flash", False))
         explicit_video_vae = (
             "minimax_h3_video_vae_filename" in (model_def or {})
         )
@@ -2242,10 +2295,30 @@ class family_handler:
         )
         dasiwa = bool((model_def or {}).get("minimax_h3_dasiwa", False))
         baked_turbo = bool((model_def or {}).get("minimax_h3_baked_turbo", False))
+        if hyperflow_flash and (full_checkpoint or fused_turbo or singularity or dasiwa or baked_turbo or ptd_refasymopd or vdn or fasth3):
+            raise ValueError("HyperFlow Flash requires its separate pruned H3 checkpoint and cannot combine with another fixed-schedule family.")
         import_profile = (model_def or {}).get("minimax_h3_import_profile")
         locked_inference_steps = bool(
-            (model_def or {}).get("lock_inference_steps", False)
+            (model_def or {}).get("lock_inference_steps", False) or dwd_steps
         )
+        if dwd_steps and (
+            base_model_type not in {_MODEL_TYPE, _FULL_MODEL_TYPE}
+            or audio_only
+            or vdn
+            or ptd_refasymopd
+            or fused_turbo
+            or fasth3
+            or hyperflow_flash
+            or singularity
+            or dasiwa
+            or baked_turbo
+            or bool(import_profile)
+            or bool((model_def or {}).get("minimax_h3_pika_flex"))
+            or bool((model_def or {}).get("minimax_h3_viggle"))
+        ):
+            raise ValueError(
+                "pi-H3 DWD requires a dedicated Pruned or Full FL2VA Frames model without another H3 variant."
+            )
         sla_attention = fused_turbo or (
             base_model_type
             in {
@@ -2430,6 +2503,18 @@ class family_handler:
             "disk, RAM, and loading cost. H3 LoRAs, including Turbo, are "
             "converted automatically when their AdaLN layout differs."
         )
+        if hyperflow_flash:
+            workflow_help = (
+                "HYPERFLOW FLASH 14B\n"
+                "Use the checkpoint's endpoint-conditioned few-step schedule for synchronized H3 video and audio. "
+                "The References entry accepts ordered image, video, and audio guidance; the Frames entry accepts first/last/timed frames and supported source conditioning."
+            )
+            checkpoint_help = (
+                "EXPERIMENTAL DISTILLED CHECKPOINT\n"
+                "This is a separate 14B HyperFlow Flash checkpoint family, around 15 GB, with 4, 6 (default), or 8 Euler evaluations and fixed video/audio shifts 12/3. "
+                "A second latent-upscaled H3 pass can use 1–8 evaluations from the tail of its eight-step grid. HyperFlow Flash uses no guidance or step caching. "
+                "The existing eight-step HyperFlow Ref2VA LoRA remains a separate adapter for ordinary H3 Ref2VA."
+            )
         result = {
             "dtype": "bf16",
             "fps": 24,
@@ -2500,9 +2585,9 @@ class family_handler:
             # explicit so the UI still distinguishes Audio In from Audio Out.
             "supports_reference_audio": omni_reference,
             "no_negative_prompt": True,
-            "guidance_max_phases": 1 if ptd_refasymopd else 0,
-            "lock_guidance_phases": ptd_refasymopd,
-            "lock_guidance_scale": ptd_refasymopd,
+            "guidance_max_phases": 1 if ptd_refasymopd or hyperflow_flash or dwd_steps else 0,
+            "lock_guidance_phases": ptd_refasymopd or hyperflow_flash or bool(dwd_steps),
+            "lock_guidance_scale": ptd_refasymopd or hyperflow_flash or bool(dwd_steps),
             "visible_phases": 0,
             "compile": False,
             # H3's packed BF16 head-dimension-128 attention can use the
@@ -2520,7 +2605,8 @@ class family_handler:
                 "dense_last_steps": 0,
                 "protect_audio": True,
             },
-            "first_block_cache": not fused_turbo and not ptd_refasymopd,
+            "first_block_cache": not fused_turbo and not ptd_refasymopd and not hyperflow_flash and not dwd_steps,
+            "spectrum_cache": not hyperflow_flash and not dwd_steps,
             "first_block_cache_thresholds": _FIRST_BLOCK_CACHE_THRESHOLDS,
             "skip_steps_multiplier_choices": _FIRST_BLOCK_CACHE_STRENGTHS,
             "skip_steps_multiplier_label": "First Block Cache Threshold",
@@ -2534,7 +2620,11 @@ class family_handler:
             "auto_resolution_budgets": _H3_AUTO_RESOLUTION_BUDGETS,
             "auto_resolution_fallbacks": _H3_AUTO_RESOLUTION_FALLBACKS,
             "profiles_dir": (
-                ["minimax_h3", "minimax_h3_fl2va"]
+                (["minimax_h3_hyperflow_ref2va"] if omni_reference else [])
+                if hyperflow_flash
+                else []
+                if dwd_steps
+                else (["minimax_h3", "minimax_h3_fl2va"]
                 if not (
                     audio_only
                     or omni_reference
@@ -2545,7 +2635,7 @@ class family_handler:
                     or baked_turbo
                     or import_profile
                 )
-                else ["minimax_h3"]
+                else ["minimax_h3"])
             ),
             "minimax_h3_assets_root": _ASSETS_ROOT,
             "text_encoder_folder": _ASSETS_ROOT,
@@ -2561,7 +2651,7 @@ class family_handler:
             # to INT8 does not download a second ~20B transformer.
             "compatible_model_paths": (
                 {}
-                if full_checkpoint or fused_turbo or singularity
+                if full_checkpoint or fused_turbo or singularity or hyperflow_flash
                 else {
                     (
                         _REF2VA_TRANSFORMER
@@ -2589,7 +2679,7 @@ class family_handler:
             ),
             "compatible_model_qkv_layouts": (
                 {}
-                if full_checkpoint or fused_turbo or singularity
+                if full_checkpoint or fused_turbo or singularity or hyperflow_flash
                 else {
                     (
                         _WANGP_REF2VA_PRUNED_TRANSFORMER
@@ -2618,7 +2708,9 @@ class family_handler:
                 )
             },
             "minimax_h3_full_checkpoint": full_checkpoint,
+            "dwd": dwd_steps,
             "minimax_h3_fused_turbo": fused_turbo,
+            "minimax_h3_hyperflow_flash": hyperflow_flash,
             "minimax_h3_ptd_refasymopd": ptd_refasymopd,
             "minimax_h3_two_pass_compatible": two_pass_compatible,
             "minimax_h3_singularity": singularity,
@@ -2666,14 +2758,14 @@ class family_handler:
             "model_size_gb": (model_def or {}).get("model_size_gb"),
             "lock_inference_steps": (
                 True
-                if ptd_refasymopd
+                if ptd_refasymopd or dwd_steps
                 else (False if fused_turbo else locked_inference_steps)
             ),
             "inference_steps_min": (
-                8 if ptd_refasymopd else (_H3_FUSED_MIN_EVALUATIONS if fused_turbo else 1)
+                8 if ptd_refasymopd else (dwd_steps if dwd_steps else (_H3_FUSED_MIN_EVALUATIONS if fused_turbo else 1))
             ),
             "inference_steps_max": (
-                8 if ptd_refasymopd else (_H3_FUSED_MAX_EVALUATIONS if fused_turbo else 50)
+                8 if ptd_refasymopd else (dwd_steps if dwd_steps else (_H3_FUSED_MAX_EVALUATIONS if fused_turbo else 50))
             ),
             "inference_steps_label": (
                 "Total Steps" if fused_turbo else "Inference Steps"
@@ -2685,7 +2777,7 @@ class family_handler:
             ),
             "minimax_h3_qkv_layout": (
                 "grouped"
-                if fused_turbo or singularity
+                if fused_turbo or singularity or hyperflow_flash
                 else ("interleaved" if full_checkpoint else "contiguous")
             ),
             "minimax_h3_sampler": (
@@ -2839,7 +2931,7 @@ class family_handler:
                     "minimax_h3_media_sources": True,
                 }
             )
-        result["custom_settings"] = [
+        result["custom_settings"] = ([] if hyperflow_flash else [
             {"id": "h3_mask_mode", "name": "Mask Denoising Mode", "label": "Mask Denoising Mode",
              "type": "dropdown", "default": "grouped_rows",
              "choices": [("Grouped Rows (clean fixed region)", "grouped_rows"),
@@ -2847,7 +2939,7 @@ class family_handler:
             {"id": "audio_refinement", "name": "Audio Refinement Extra Phase", "label": "Audio Refinement Extra Phase",
              "type": "dropdown", "default": "none",
              "choices": [("Off", "none"), ("Enabled — 6 extra steps", "enabled")]},
-        ]
+        ])
         if two_pass_compatible:
             from models.minimax_h3.two_pass import (
                 H3_PHASE2_ACCELERATOR_STRENGTH,
@@ -2903,6 +2995,108 @@ class family_handler:
                     },
                 ]
             )
+        if hyperflow_flash:
+            result["inference_steps_min"] = 4
+            result["inference_steps_max"] = 8
+            result["inference_steps_step"] = 2
+            result["inference_steps_label"] = "Flash Steps"
+            result["inference_steps_help"] = "Choose 4, 6 (default), or 8 evaluations on the checkpoint's fixed schedule."
+            result["minimax_h3_unaccelerated_default_steps"] = 6
+            result["minimax_h3_sampler"] = "euler"
+            result["minimax_h3_video_shift"] = 12.0
+            result["minimax_h3_audio_shift"] = 3.0
+            result["minimax_h3_hyperflow_flash"] = True
+            result["minimax_h3_accelerators_allowed"] = False
+            result["minimax_h3_two_pass_compatible"] = True
+            result["flow_shift"] = False
+            result["minimax_h3_transformer_working_vram_gb"] = 10
+            result["sample_solvers"] = [("Euler", "euler")]
+            result["first_block_cache"] = False
+            result["spectrum_cache"] = False
+            result["sol_attention"] = False
+            result["sla_attention"] = False
+            result["sla_attention_default"] = False
+            result["sla_attention_experimental"] = False
+            result["veda_attention"] = False
+            result["veda_attention_experimental"] = False
+            result["override_attention"] = "sdpa"
+            result["compatible_model_paths"] = {}
+            result["compatible_model_qkv_layouts"] = {}
+            result["preset_profiles_dir"] = []
+            result["minimax_h3_default_turbo_preset"] = ""
+            result["minimax_h3_turbo_mode_default"] = False
+            result["minimax_h3_model_id"] = str((model_def or {}).get("minimax_h3_model_id") or "")
+            result["lora_compatibility_note"] = (
+                "Ordinary H3 LoRAs are mapped approximately to Flash's two-time AdaLN inputs. "
+                "The existing eight-step HyperFlow Ref2VA offset LoRA belongs to ordinary H3 Ref2VA and is not used by this checkpoint."
+            )
+            if two_pass_compatible:
+                result["custom_settings"] = [
+                    setting for setting in result["custom_settings"]
+                    if setting.get("id") not in {
+                        H3_PHASE2_NOISE,
+                        H3_PHASE2_ACCELERATOR_STRENGTH,
+                    }
+                ]
+                for setting in result["custom_settings"]:
+                    if setting.get("id") == "h3_phase2_steps":
+                        setting.update({"min": 1, "max": 8, "default": 3,
+                                        "description": "Phase 2 uses the selected number of evaluations from the tail of HyperFlow Flash's eight-step grid."})
+            else:
+                result["custom_settings"] = []
+        if dwd_steps:
+            result.update(
+                {
+                    "dwd": dwd_steps,
+                    "minimax_h3_dwd": True,
+                    "minimax_h3_model_id": str(
+                        (model_def or {}).get("minimax_h3_model_id")
+                        or (
+                            f"minimax_h3_full_pi_dwd_{dwd_steps}step"
+                            if full_checkpoint
+                            else f"minimax_h3_pi_dwd_{dwd_steps}step"
+                        )
+                    ),
+                    "minimax_h3_two_pass_compatible": False,
+                    "minimax_h3_accelerators_allowed": False,
+                    "minimax_h3_sampler": "euler",
+                    "minimax_h3_video_shift": 12.0,
+                    "minimax_h3_audio_shift": 3.0,
+                    "lock_inference_steps": True,
+                    "inference_steps_min": dwd_steps,
+                    "inference_steps_max": dwd_steps,
+                    "inference_steps_label": "Denoising Steps",
+                    "inference_steps_help": (
+                        f"pi-H3 DWD uses exactly {dwd_steps} Euler evaluations on its trained schedule."
+                    ),
+                    "guidance_max_phases": 1,
+                    "lock_guidance_phases": True,
+                    "lock_guidance_scale": True,
+                    "sample_solvers": [("Euler", "euler")],
+                    "flow_shift": False,
+                    "first_block_cache": False,
+                    "spectrum_cache": False,
+                    "preset_profiles_dir": [],
+                    "profiles_dir": [],
+                    "custom_settings": [],
+                    "minimax_h3_default_turbo_preset": "",
+                    "minimax_h3_turbo_mode_default": False,
+                    "minimax_h3_video_vae_auto": False,
+                    "minimax_h3_video_vae_choices": [],
+                    "lora_compatibility_note": (
+                        "Use only the matching pi-H3 DWD adapter shipped with this model. "
+                        "The model uses its trained pixel head and one-pass schedule."
+                    ),
+                    "selector_help": (
+                        "pi-H3 DWD Frames\n"
+                        f"This dedicated {dwd_steps}-step model uses the trained pixel decoder "
+                        "instead of the video VAE. It keeps standard H3 Frames conditioning "
+                        "and synchronized audio; use full denoising, Euler, CFG 1, and the "
+                        "fixed 12/3 video/audio shifts."
+                    ),
+                }
+            )
+            result.pop("vae_upsamplers", None)
         if fused_turbo or (model_def or {}).get("lock_inference_steps", False):
             result["custom_settings"] = result["custom_settings"][:1]
         if ptd_refasymopd:
@@ -3471,6 +3665,19 @@ class family_handler:
         if base_model_type == _TTS_MODEL_TYPE:
             ui_defaults.update({"resolution": "32x32", "duration_seconds": 15, "video_length": 362,
                                 "sliding_window_size": 362, "audio_prompt_type": "", "multi_prompts_gen_type": 2})
+        if (model_def or {}).get("minimax_h3_hyperflow_flash"):
+            ui_defaults.update({
+                "num_inference_steps": 6,
+                "guidance_phases": 1,
+                "guidance_scale": 1.0,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "sample_solver": "euler",
+                "minimax_h3_turbo_mode": False,
+                "minimax_h3_turbo_preset": "",
+                "skip_steps_cache_type": "",
+                "override_attention": "sdpa",
+            })
         if (model_def or {}).get("minimax_h3_fasth3"):
             ui_defaults.update({"num_inference_steps": 8, "flow_shift": 12.0 if (model_def or {}).get("minimax_h3_fasth3_omniref") else 10.0,
                                 "audio_flow_shift": 3.0, "override_attention": "sdpa",
@@ -3515,6 +3722,7 @@ class family_handler:
                     "minimax_h3_reference_sequence": False,
                 }
             )
+        _apply_dwd_recipe_settings(ui_defaults, model_def)
 
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
@@ -3786,6 +3994,7 @@ class family_handler:
             "first_block",
         }:
             ui_defaults["skip_steps_cache_type"] = ""
+        _apply_dwd_recipe_settings(ui_defaults, model_def)
 
     @staticmethod
     def custom_prompt_preprocess(
@@ -3863,11 +4072,32 @@ class family_handler:
             except (ValueError, TypeError) as error:
                 return str(error)
             return None
-        if base_model_type in {"viggle_remake_swap", "viggle_remake_edit"}:
+        if (
+            base_model_type in {
+                "viggle_remake_swap",
+                "viggle_remake_swap_aligned",
+                "viggle_remake_edit",
+            }
+            or (model_def or {}).get("minimax_h3_aligned_guide") is True
+        ):
             from models.minimax_h3.viggle_remake import validate_remake_inputs
 
             try:
-                validate_remake_inputs(inputs)
+                aligned_guide = (model_def or {}).get("minimax_h3_aligned_guide") is True
+                if aligned_guide and (
+                    (model_def or {}).get("omni_reference") is not True
+                    or (model_def or {}).get("minimax_h3_lora_workflow") != "ref2va"
+                ):
+                    return "BFS Aligned Swap requires its Ref2VA model profile."
+                validate_remake_inputs(inputs, aligned_guide=aligned_guide)
+                if aligned_guide:
+                    from models.minimax_h3.viggle_remake import (
+                        validate_aligned_guide_lora_names,
+                    )
+
+                    validate_aligned_guide_lora_names(
+                        inputs.get("activated_loras") or ()
+                    )
             except ValueError as error:
                 return str(error)
             return None
@@ -3917,10 +4147,136 @@ class family_handler:
                 two_pass_unavailable_reason,
             )
 
-            two_pass_settings = normalize_two_pass_settings(custom)
+            two_pass_settings = normalize_two_pass_settings(custom, model_def)
         except (ValueError, TypeError) as error:
             return str(error)
 
+        hyperflow_flash = model_def.get("minimax_h3_hyperflow_flash") is True
+        if hyperflow_flash:
+            from models.minimax_h3.two_pass import resolve_h3_sample_solver
+            from models.minimax_h3.turbo import (
+                find_minimax_h3_accelerators,
+                minimax_h3_turbo_preset_for_path,
+            )
+
+            try:
+                steps = int(inputs.get("num_inference_steps", 6))
+                phases = int(inputs.get("guidance_phases", 1))
+                scale = float(inputs.get("guidance_scale", 1.0))
+                video_shift = float(inputs.get("flow_shift", 12.0))
+                audio_shift = float(inputs.get("audio_flow_shift", 3.0))
+                strength = float(inputs.get("denoising_strength", 1.0))
+            except (TypeError, ValueError):
+                return "HyperFlow Flash requires 4, 6, or 8 Euler evaluations, CFG 1, and fixed shifts 12/3."
+            if steps not in (4, 6, 8):
+                return "HyperFlow Flash phase 1 supports exactly 4, 6, or 8 evaluations."
+            solver = resolve_h3_sample_solver(inputs.get("sample_solver"), model_def)
+            if solver != "euler":
+                return "HyperFlow Flash requires the Euler sampler."
+            if phases != 1:
+                return "Use the H3 Two-Pass setting for HyperFlow Flash's second phase."
+            if scale != 1.0 or video_shift != 12.0 or audio_shift != 3.0:
+                return "HyperFlow Flash requires guidance scale 1 and video/audio shifts 12/3."
+            if strength != 1.0:
+                return "HyperFlow Flash requires full denoising strength 1.0."
+            if inputs.get("skip_steps_cache_type") not in (None, ""):
+                return "HyperFlow Flash does not support step caching."
+            if custom.get("audio_refinement", "none") == "enabled":
+                return "HyperFlow Flash does not support Audio Refinement."
+            if inputs.get("_face_refinement") or inputs.get("face_refinement"):
+                return "HyperFlow Flash does not support face refinement."
+            if has_h3_edit_mask_or_outpainting(inputs):
+                return "HyperFlow Flash does not support video edit masks or outpainting."
+            selected_loras = (
+                inputs.get("activated_loras")
+                or inputs.get("loras_selected")
+                or ()
+            )
+            selected_loras = (
+                selected_loras
+                if isinstance(selected_loras, (list, tuple))
+                else [selected_loras]
+            )
+            old_hyperflow = any(
+                (minimax_h3_turbo_preset_for_path(str(path)) or {}).get("id")
+                == "hyperflow-ref2va-8step"
+                for path in selected_loras
+            )
+            if old_hyperflow:
+                return (
+                    "The existing eight-step HyperFlow Ref2VA LoRA is for the "
+                    "ordinary H3 Ref2VA checkpoint, not HyperFlow Flash."
+                )
+            if find_minimax_h3_accelerators(selected_loras):
+                return (
+                    "HyperFlow Flash has its own checkpoint schedule and does "
+                    "not support additional H3 Turbo, PDD, Pika, or DMAD accelerators."
+                )
+            inputs.update({
+                "sample_solver": "euler",
+                "guidance_scale": 1.0,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "skip_steps_cache_type": "",
+                "minimax_h3_turbo_mode": False,
+                "minimax_h3_turbo_preset": "",
+            })
+        dwd_steps = int(model_def.get("dwd", 0) or 0)
+        if dwd_steps:
+            if base_model_type not in {_MODEL_TYPE, _FULL_MODEL_TYPE}:
+                return "pi-H3 DWD requires a dedicated FL2VA Frames model."
+            try:
+                steps = int(inputs.get("num_inference_steps", dwd_steps))
+                phases = int(inputs.get("guidance_phases", 1))
+                guidance_scale = float(inputs.get("guidance_scale", 1.0))
+                video_shift = float(inputs.get("flow_shift", 12.0))
+                audio_shift = float(inputs.get("audio_flow_shift", 3.0))
+                denoising_strength = float(
+                    inputs.get("denoising_strength", 1.0)
+                )
+            except (TypeError, ValueError):
+                return f"pi-H3 DWD requires its fixed {dwd_steps}-step Euler recipe."
+            if steps != dwd_steps:
+                return f"pi-H3 DWD requires exactly {dwd_steps} denoising evaluations."
+            if resolve_h3_sample_solver(inputs.get("sample_solver"), model_def) != "euler":
+                return "pi-H3 DWD requires the Euler sampler."
+            if phases != 1:
+                return "pi-H3 DWD requires exactly one guidance phase."
+            if guidance_scale != 1.0:
+                return "pi-H3 DWD requires guidance scale 1.0 (CFG 1)."
+            if video_shift != 12.0 or audio_shift != 3.0:
+                return "pi-H3 DWD requires video/audio flow shifts 12/3."
+            if denoising_strength != 1.0:
+                return "pi-H3 DWD requires full denoising strength 1.0."
+            if two_pass_settings[H3_TWO_PASS_ENABLED] == "on":
+                return "pi-H3 DWD does not support H3 Two-Pass."
+            if custom.get("audio_refinement", "none") == "enabled":
+                return "pi-H3 DWD does not support Audio Refinement."
+            if inputs.get("_face_refinement") or inputs.get("face_refinement"):
+                return "pi-H3 DWD does not support face refinement."
+            if inputs.get("skip_steps_cache_type") not in (None, ""):
+                return "pi-H3 DWD does not support step caching."
+            raw_sigmas = inputs.get("custom_sigmas")
+            if raw_sigmas not in (None, ""):
+                from .pi_h3 import pi_h3_sigmas
+
+                try:
+                    if isinstance(raw_sigmas, str):
+                        values = [
+                            float(value.strip())
+                            for value in raw_sigmas.replace(";", ",").split(",")
+                            if value.strip()
+                        ]
+                    else:
+                        values = [float(value) for value in raw_sigmas]
+                except (TypeError, ValueError):
+                    return "pi-H3 DWD custom sigmas must match its trained schedule."
+                trained = pi_h3_sigmas(dwd_steps, 12.0)
+                if len(values) != len(trained) or any(
+                    abs(actual - expected) > 1e-5
+                    for actual, expected in zip(values, trained)
+                ):
+                    return "pi-H3 DWD custom sigmas must match its trained schedule."
         ptd_refasymopd = (
             model_def.get(
                 "minimax_h3_ptd_refasymopd",
